@@ -21,7 +21,7 @@ use std::os::unix::process::CommandExt;
 use std::ptr;
 use std::process::{Command, Stdio};
 
-use libc::{self, winsize, c_int, pid_t, WNOHANG, WIFEXITED, WEXITSTATUS, SIGCHLD, TIOCSCTTY};
+use libc::{self, winsize, c_int, pid_t, WNOHANG, SIGCHLD, TIOCSCTTY};
 
 use term::SizeInfo;
 use display::OnResize;
@@ -37,7 +37,7 @@ static mut PID: pid_t = 0;
 ///
 /// Calling exit() in the SIGCHLD handler sometimes causes opengl to deadlock,
 /// and the process hangs. Instead, this flag is set, and its status can be
-/// cheked via `process_should_exit`.
+/// checked via `process_should_exit`.
 static mut SHOULD_EXIT: bool = false;
 
 extern "C" fn sigchld(_a: c_int) {
@@ -48,15 +48,9 @@ extern "C" fn sigchld(_a: c_int) {
             die!("Waiting for pid {} failed: {}\n", PID, errno());
         }
 
-        if PID != p {
-            return;
+        if PID == p {
+            SHOULD_EXIT = true;
         }
-
-        if !WIFEXITED(status) || WEXITSTATUS(status) != 0 {
-            die!("child finished with error '{}'\n", status);
-        }
-
-        SHOULD_EXIT = true;
     }
 }
 
@@ -180,7 +174,7 @@ fn get_pw_entry(buf: &mut [i8; 1024]) -> Passwd {
 }
 
 /// Create a new tty and return a handle to interact with it.
-pub fn new<T: ToWinsize>(config: &Config, options: &Options, size: T) -> Pty {
+pub fn new<T: ToWinsize>(config: &Config, options: &Options, size: T, window_id: Option<usize>) -> Pty {
     let win = size.to_winsize();
     let mut buf = [0; 1024];
     let pw = get_pw_entry(&mut buf);
@@ -188,16 +182,20 @@ pub fn new<T: ToWinsize>(config: &Config, options: &Options, size: T) -> Pty {
     let (master, slave) = openpty(win.ws_row as _, win.ws_col as _);
 
     let default_shell = &Shell::new(pw.shell);
-    let shell = options.shell()
-        .or_else(|| config.shell())
-        .unwrap_or(&default_shell);
+    let shell = config.shell()
+        .unwrap_or(default_shell);
 
-    let mut builder = Command::new(shell.program());
-    for arg in shell.args() {
+    let initial_command = options.command().unwrap_or(shell);
+
+    let mut builder = Command::new(initial_command.program());
+    for arg in initial_command.args() {
         builder.arg(arg);
     }
 
     // Setup child stdin/stdout/stderr as slave fd of pty
+    // Ownership of fd is transferred to the Stdio structs and will be closed by them at the end of
+    // this scope. (It is not an issue that the fd is closed three times since File::drop ignores
+    // error on libc::close.)
     builder.stdin(unsafe { Stdio::from_raw_fd(slave) });
     builder.stderr(unsafe { Stdio::from_raw_fd(slave) });
     builder.stdout(unsafe { Stdio::from_raw_fd(slave) });
@@ -208,6 +206,9 @@ pub fn new<T: ToWinsize>(config: &Config, options: &Options, size: T) -> Pty {
     builder.env("SHELL", shell.program());
     builder.env("HOME", pw.dir);
     builder.env("TERM", "xterm-256color"); // default term until we can supply our own
+    if let Some(window_id) = window_id {
+        builder.env("WINDOWID", format!("{}", window_id));
+    }
     for (key, value) in config.env().iter() {
         builder.env(key, value);
     }
@@ -240,6 +241,11 @@ pub fn new<T: ToWinsize>(config: &Config, options: &Options, size: T) -> Pty {
         Ok(())
     });
 
+    // Handle set working directory option
+    if let Some(ref dir) = options.working_dir {
+        builder.current_dir(dir.as_path());
+    }
+
     match builder.spawn() {
         Ok(child) => {
             unsafe {
@@ -248,9 +254,6 @@ pub fn new<T: ToWinsize>(config: &Config, options: &Options, size: T) -> Pty {
 
                 // Handle SIGCHLD
                 libc::signal(SIGCHLD, sigchld as _);
-
-                // Parent doesn't need slave fd
-                libc::close(slave);
             }
             unsafe {
                 // Maybe this should be done outside of this function so nonblocking

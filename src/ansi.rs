@@ -23,6 +23,80 @@ use index::{Column, Line, Contains};
 
 use ::Rgb;
 
+// Parse color arguments
+//
+// Expect that color argument looks like "rgb:xx/xx/xx" or "#xxxxxx"
+fn parse_rgb_color(color: &[u8]) -> Option<Rgb> {
+    let mut iter = color.iter();
+
+    macro_rules! next {
+        () => {
+            iter.next().map(|v| *v as char)
+        }
+    }
+
+    macro_rules! parse_hex {
+        () => {{
+            let mut digit: u8 = 0;
+            let next = next!().and_then(|v| v.to_digit(16));
+            if let Some(value) = next {
+                digit = value as u8;
+            }
+
+            let next = next!().and_then(|v| v.to_digit(16));
+            if let Some(value) = next {
+                digit <<= 4;
+                digit += value as u8;
+            }
+            digit
+        }}
+    }
+
+    match next!() {
+        Some('r') => {
+            if next!() != Some('g') { return None; }
+            if next!() != Some('b') { return None; }
+            if next!() != Some(':') { return None; }
+
+            let r = parse_hex!();
+            let val = next!();
+            if val != Some('/') { println!("val={:?}", val); return None; }
+            let g = parse_hex!();
+            if next!() != Some('/') { return None; }
+            let b = parse_hex!();
+
+            Some(Rgb { r: r, g: g, b: b})
+        }
+        Some('#') => {
+            Some(Rgb {
+                r: parse_hex!(),
+                g: parse_hex!(),
+                b: parse_hex!(),
+            })
+        }
+        _ => None
+    }
+}
+
+fn parse_number(input: &[u8]) -> Option<u8> {
+    if input.is_empty() {
+        return None;
+    }
+    let mut num: u8 = 0;
+    for c in input {
+        let c = *c as char;
+        if let Some(digit) = c.to_digit(10) {
+            num = match num.checked_mul(10).and_then(|v| v.checked_add(digit as u8)) {
+                Some(v) => v,
+                None => return None,
+            }
+        } else {
+            return None;
+        }
+    }
+    Some(num)
+}
+
 /// The processor wraps a `vte::Parser` to ultimately call methods on a Handler
 pub struct Processor {
     state: ProcessorState,
@@ -30,7 +104,9 @@ pub struct Processor {
 }
 
 /// Internal state for VTE processor
-struct ProcessorState;
+struct ProcessorState {
+    preceding_char: Option<char>
+}
 
 /// Helper type that implements `vte::Perform`.
 ///
@@ -61,7 +137,7 @@ impl<'a, H: Handler + TermInfo + 'a, W: io::Write> Performer<'a, H, W> {
 impl Default for Processor {
     fn default() -> Processor {
         Processor {
-            state: ProcessorState,
+            state: ProcessorState { preceding_char: None },
             parser: vte::Parser::new(),
         }
     }
@@ -102,6 +178,9 @@ pub trait Handler {
     /// OSC to set window title
     fn set_title(&mut self, &str) {}
 
+    /// Set the cursor style
+    fn set_cursor_style(&mut self, _: CursorStyle) {}
+
     /// A character to be displayed
     fn input(&mut self, _c: char) {}
 
@@ -127,6 +206,9 @@ pub trait Handler {
     ///
     /// TODO this should probably return an io::Result
     fn identify_terminal<W: io::Write>(&mut self, &mut W) {}
+
+    // Report device status
+    fn device_status<W: io::Write>(&mut self, &mut W, usize) {}
 
     /// Move cursor forward `cols`
     fn move_forward(&mut self, Column) {}
@@ -236,12 +318,12 @@ pub trait Handler {
     /// DECKPAM - Set keypad to applications mode (ESCape instead of digits)
     fn set_keypad_application_mode(&mut self) {}
 
-    /// DECKPNM - Set keypad to numeric mode (digits intead of ESCape seq)
+    /// DECKPNM - Set keypad to numeric mode (digits instead of ESCape seq)
     fn unset_keypad_application_mode(&mut self) {}
 
     /// Set one of the graphic character sets, G0 to G3, as the active charset.
     ///
-    /// 'Invoke' one of G0 to G3 in the GL area. Also refered to as shift in,
+    /// 'Invoke' one of G0 to G3 in the GL area. Also referred to as shift in,
     /// shift out and locking shift depending on the set being activated
     fn set_active_charset(&mut self, CharsetIndex) {}
 
@@ -253,6 +335,25 @@ pub trait Handler {
 
     /// Set an indexed color value
     fn set_color(&mut self, usize, Rgb) {}
+
+    /// Reset an indexed color to original value
+    fn reset_color(&mut self, usize) {}
+
+    /// Run the dectest routine
+    fn dectest(&mut self) {}
+}
+
+/// Describes shape of cursor
+#[derive(Debug, Eq, PartialEq, Copy, Clone)]
+pub enum CursorStyle {
+    /// Cursor is a block like `▒`
+    Block,
+
+    /// Cursor is an underscore like `_`
+    Underline,
+
+    /// Cursor is a vertical bar `⎸`
+    Beam,
 }
 
 /// Terminal modes
@@ -260,18 +361,44 @@ pub trait Handler {
 pub enum Mode {
     /// ?1
     CursorKeys = 1,
+    /// Select 80 or 132 columns per page
+    ///
+    /// CSI ? 3 h -> set 132 column font
+    /// CSI ? 3 l -> reset 80 column font
+    ///
+    /// Additionally,
+    ///
+    /// * set margins to default positions
+    /// * erases all data in page memory
+    /// * resets DECLRMM to unavailable
+    /// * clears data from the status line (if set to host-writable)
+    DECCOLM = 3,
+    /// IRM Insert Mode
+    ///
+    /// NB should be part of non-private mode enum
+    ///
+    /// * `CSI 4 h` change to insert mode
+    /// * `CSI 4 l` reset to replacement mode
+    Insert = 4,
     /// ?6
     Origin = 6,
     /// ?7
     LineWrap = 7,
     /// ?12
     BlinkingCursor = 12,
+    /// 20
+    ///
+    /// NB This is actually a private mode. We should consider adding a second
+    /// enumeration for public/private modesets.
+    LineFeedNewLine = 20,
     /// ?25
     ShowCursor = 25,
     /// ?1000
     ReportMouseClicks = 1000,
     /// ?1002
     ReportMouseMotion = 1002,
+    /// ?1004
+    ReportFocusInOut = 1004,
     /// ?1006
     SgrMouse = 1006,
     /// ?1049
@@ -288,20 +415,25 @@ impl Mode {
         if private {
             Some(match num {
                 1 => Mode::CursorKeys,
+                3 => Mode::DECCOLM,
                 6 => Mode::Origin,
                 7 => Mode::LineWrap,
                 12 => Mode::BlinkingCursor,
                 25 => Mode::ShowCursor,
                 1000 => Mode::ReportMouseClicks,
                 1002 => Mode::ReportMouseMotion,
+                1004 => Mode::ReportFocusInOut,
                 1006 => Mode::SgrMouse,
                 1049 => Mode::SwapScreenAndSetRestoreCursor,
                 2004 => Mode::BracketedPaste,
                 _ => return None
             })
         } else {
-            // TODO
-            None
+            Some(match num {
+                4 => Mode::Insert,
+                20 => Mode::LineFeedNewLine,
+                _ => return None
+            })
         }
     }
 }
@@ -389,6 +521,22 @@ pub enum NamedColor {
     CursorText,
     /// Color for the cursor itself
     Cursor,
+    /// Dim black
+    DimBlack,
+    /// Dim red
+    DimRed,
+    /// Dim green
+    DimGreen,
+    /// Dim yellow
+    DimYellow,
+    /// Dim blue
+    DimBlue,
+    /// Dim magenta
+    DimMagenta,
+    /// Dim cyan
+    DimCyan,
+    /// Dim white
+    DimWhite,
 }
 
 impl NamedColor {
@@ -402,6 +550,36 @@ impl NamedColor {
             NamedColor::Magenta => NamedColor::BrightMagenta,
             NamedColor::Cyan => NamedColor::BrightCyan,
             NamedColor::White => NamedColor::BrightWhite,
+            NamedColor::DimBlack => NamedColor::Black,
+            NamedColor::DimRed => NamedColor::Red,
+            NamedColor::DimGreen => NamedColor::Green,
+            NamedColor::DimYellow => NamedColor::Yellow,
+            NamedColor::DimBlue => NamedColor::Blue,
+            NamedColor::DimMagenta => NamedColor::Magenta,
+            NamedColor::DimCyan => NamedColor::Cyan,
+            NamedColor::DimWhite => NamedColor::White,
+            val => val
+        }
+    }
+
+    pub fn to_dim(&self) -> Self {
+        match *self {
+            NamedColor::Black => NamedColor::DimBlack,
+            NamedColor::Red => NamedColor::DimRed,
+            NamedColor::Green => NamedColor::DimGreen,
+            NamedColor::Yellow => NamedColor::DimYellow,
+            NamedColor::Blue => NamedColor::DimBlue,
+            NamedColor::Magenta => NamedColor::DimMagenta,
+            NamedColor::Cyan => NamedColor::DimCyan,
+            NamedColor::White => NamedColor::DimWhite,
+            NamedColor::BrightBlack => NamedColor::Black,
+            NamedColor::BrightRed => NamedColor::Red,
+            NamedColor::BrightGreen => NamedColor::Green,
+            NamedColor::BrightYellow => NamedColor::Yellow,
+            NamedColor::BrightBlue => NamedColor::Blue,
+            NamedColor::BrightMagenta => NamedColor::Magenta,
+            NamedColor::BrightCyan => NamedColor::Cyan,
+            NamedColor::BrightWhite => NamedColor::White,
             val => val
         }
     }
@@ -437,6 +615,8 @@ pub enum Attr {
     Hidden,
     /// Strikethrough text
     Strike,
+    /// Cancel bold
+    CancelBold,
     /// Cancel bold and dim
     CancelBoldDim,
     /// Cancel italic
@@ -493,6 +673,7 @@ impl<'a, H, W> vte::Perform for Performer<'a, H, W>
     #[inline]
     fn print(&mut self, c: char) {
         self.handler.input(c);
+        self._state.preceding_char = Some(c);
     }
 
     #[inline]
@@ -550,9 +731,9 @@ impl<'a, H, W> vte::Perform for Performer<'a, H, W>
             return;
         }
 
-        match params[0][0] {
+        match params[0] {
             // Set window title
-            b'0' | b'2' => {
+            b"0" | b"2" => {
                 if params.len() < 2 {
                     return unhandled!();
                 }
@@ -564,82 +745,100 @@ impl<'a, H, W> vte::Perform for Performer<'a, H, W>
 
             // Set icon name
             // This is ignored, since alacritty has no concept of tabs
-            b'1' => return,
+            b"1" => return,
 
             // Set color index
-            b'4' => {
-                if params.len() < 3 {
+            b"4" => {
+                if params.len() == 1 || params.len() % 2 == 0 {
                     return unhandled!();
                 }
 
-                // Parse index
-                let index = {
-                    let raw = params[1];
-                    if raw.len() > 3 {
-                        return unhandled!();
-                    }
-                    let mut index: u8 = 0;
-                    for c in raw {
-                        let c = *c as char;
-                        if let Some(digit) = c.to_digit(10) {
-                            index *= 10;
-                            index += digit as u8;
+                for chunk in params[1..].chunks(2) {
+                    if let Some(index) = parse_number(chunk[0]) {
+                        if let Some(color) = parse_rgb_color(chunk[1]) {
+                            self.handler.set_color(index as usize, color);
+                        } else {
+                            unhandled!();
                         }
+                    } else {
+                        unhandled!();
                     }
-
-                    index
-                };
-
-                // Check that index is a valid u8
-                if index & 0xff != index {
-                    return unhandled!();
                 }
-
-                // Parse color arguments
-                //
-                // Expect that color argument looks like "rgb:xx/xx/xx"
-                let color = {
-                    let raw = params[2];
-                    let mut iter = raw.iter();
-                    macro_rules! next {
-                        () => {
-                            iter.next().map(|v| *v as char)
-                        }
-                    }
-                    if next!() != Some('r') { return unhandled!(); }
-                    if next!() != Some('g') { return unhandled!(); }
-                    if next!() != Some('b') { return unhandled!(); }
-                    if next!() != Some(':') { return unhandled!(); }
-
-                    macro_rules! parse_hex {
-                        () => {{
-                            let mut digit: u8 = 0;
-                            let next = next!().and_then(|v| v.to_digit(16));
-                            if let Some(value) = next {
-                                digit = value as u8;
-                            }
-
-                            let next = next!().and_then(|v| v.to_digit(16));
-                            if let Some(value) = next {
-                                digit <<= 4;
-                                digit += value as u8;
-                            }
-                            digit
-                        }}
-                    }
-
-                    let r = parse_hex!();
-                    let val = next!();
-                    if val != Some('/') { println!("val={:?}", val); return unhandled!(); }
-                    let g = parse_hex!();
-                    if next!() != Some('/') { return unhandled!(); }
-                    let b = parse_hex!();
-
-                    Rgb { r: r, g: g, b: b}
-                };
-
-                self.handler.set_color(index as usize, color);
             }
+
+            // Set foreground color
+            b"10" => {
+                if params.len() < 2 {
+                    return unhandled!();
+                }
+
+                if let Some(color) = parse_rgb_color(params[1]) {
+                    self.handler.set_color(NamedColor::Foreground as usize, color);
+                } else {
+                    unhandled!()
+                }
+            }
+
+            // Set background color
+            b"11" => {
+                if params.len() < 2 {
+                    return unhandled!();
+                }
+
+                if let Some(color) = parse_rgb_color(params[1]) {
+                    self.handler.set_color(NamedColor::Background as usize, color);
+                } else {
+                    unhandled!()
+                }
+            }
+
+            // Set text cursor color
+            b"12" => {
+                if params.len() < 2 {
+                    return unhandled!();
+                }
+
+                if let Some(color) = parse_rgb_color(params[1]) {
+                    self.handler.set_color(NamedColor::Cursor as usize, color);
+                } else {
+                    unhandled!()
+                }
+            }
+
+            // Reset color index
+            b"104" => {
+                // Reset all color indexes when no parameters are given
+                if params.len() == 1 {
+                    for i in 0..256 {
+                        self.handler.reset_color(i);
+                    }
+                    return;
+                }
+
+                // Reset color indexes given as parameters
+                for param in &params[1..] {
+                    match parse_number(param) {
+                        Some(index) => self.handler.reset_color(index as usize),
+                        None => unhandled!(),
+                    }
+                }
+            }
+
+            // Reset foreground color
+            b"110" => {
+                self.handler.reset_color(NamedColor::Foreground as usize);
+            }
+
+            // Reset background color
+            b"111" => {
+                self.handler.reset_color(NamedColor::Background as usize);
+            }
+
+            // Reset text cursor color
+            b"112" => {
+                self.handler.reset_color(NamedColor::Cursor as usize);
+            }
+
             _ => {
                 unhandled!();
             }
@@ -684,8 +883,18 @@ impl<'a, H, W> vte::Perform for Performer<'a, H, W>
             'A' => {
                 handler.move_up(Line(arg_or_default!(idx: 0, default: 1) as usize));
             },
+            'b' => {
+                if let Some(c) = self._state.preceding_char {
+                    for _ in 0..arg_or_default!(idx: 0, default: 1) {
+                        handler.input(c);
+                    }
+                }
+                else {
+                    warn!("tried to repeat with no preceding char");
+                }
+            },
             'B' | 'e' => handler.move_down(Line(arg_or_default!(idx: 0, default: 1) as usize)),
-            'c' | 'n' => handler.identify_terminal(writer),
+            'c' => handler.identify_terminal(writer),
             'C' | 'a' => handler.move_forward(Column(arg_or_default!(idx: 0, default: 1) as usize)),
             'D' => handler.move_backward(Column(arg_or_default!(idx: 0, default: 1) as usize)),
             'E' => handler.move_down_and_cr(Line(arg_or_default!(idx: 0, default: 1) as usize)),
@@ -752,7 +961,7 @@ impl<'a, H, W> vte::Perform for Performer<'a, H, W>
             'm' => {
                 // Sometimes a C-style for loop is just what you need
                 let mut i = 0; // C-for initializer
-                if args.len() == 0 {
+                if args.is_empty() {
                     handler.terminal_attribute(Attr::Reset);
                     return;
                 }
@@ -773,6 +982,7 @@ impl<'a, H, W> vte::Perform for Performer<'a, H, W>
                         7 => Attr::Reverse,
                         8 => Attr::Hidden,
                         9 => Attr::Strike,
+                        21 => Attr::CancelBold,
                         22 => Attr::CancelBoldDim,
                         23 => Attr::CancelItalic,
                         24 => Attr::CancelUnderline,
@@ -840,8 +1050,7 @@ impl<'a, H, W> vte::Perform for Performer<'a, H, W>
                     i += 1; // C-for expr
                 }
             }
-            // TODO this should be a device status report
-            // 'n' => handler.identify_terminal(writer),
+            'n' => handler.device_status(writer, arg_or_default!(idx: 0, default: 0) as usize),
             'r' => {
                 if private {
                     unhandled!();
@@ -859,6 +1068,16 @@ impl<'a, H, W> vte::Perform for Performer<'a, H, W>
             },
             's' => handler.save_cursor_position(),
             'u' => handler.restore_cursor_position(),
+            'q' => {
+                let style = match arg_or_default!(idx: 0, default: 0) {
+                    0 ... 2 => CursorStyle::Block,
+                    3 | 4 => CursorStyle::Underline,
+                    5 | 6 => CursorStyle::Beam,
+                    _ => unhandled!()
+                };
+
+                handler.set_cursor_style(style);
+            }
             _ => unhandled!(),
         }
     }
@@ -895,14 +1114,23 @@ impl<'a, H, W> vte::Perform for Performer<'a, H, W>
         match byte {
             b'B' => configure_charset!(StandardCharset::Ascii),
             b'D' => self.handler.linefeed(),
-            b'E' => self.handler.newline(),
+            b'E' => {
+                self.handler.linefeed();
+                self.handler.carriage_return();
+            }
             b'H' => self.handler.set_horizontal_tabstop(),
             b'M' => self.handler.reverse_index(),
             b'Z' => self.handler.identify_terminal(self.writer),
             b'c' => self.handler.reset_state(),
             b'0' => configure_charset!(StandardCharset::SpecialCharacterAndLineDrawing),
             b'7' => self.handler.save_cursor_position(),
-            b'8' => self.handler.restore_cursor_position(),
+            b'8' => {
+                if !intermediates.is_empty() && intermediates[0] == b'#' {
+                    self.handler.dectest();
+                } else {
+                    self.handler.restore_cursor_position();
+                }
+            }
             b'=' => self.handler.set_keypad_application_mode(),
             b'>' => self.handler.unset_keypad_application_mode(),
             b'\\' => (), // String terminator, do nothing (parser handles as string terminator)
@@ -1045,7 +1273,7 @@ pub mod C0 {
 ///
 /// 0x80 (@), 0x81 (A), 0x82 (B), 0x83 (C) are reserved
 /// 0x98 (X), 0x99 (Y) are reserved
-/// 0x9a (Z) is resezved, but causes DEC terminals to respond with DA codes
+/// 0x9a (Z) is 'reserved', but causes DEC terminals to respond with DA codes
 #[allow(non_snake_case)]
 pub mod C1 {
     /// Reserved
@@ -1060,7 +1288,7 @@ pub mod C1 {
     pub const IND: u8 = 0x84;
     /// New line, moves done one line and to first column (CR+LF)
     pub const NEL: u8 = 0x85;
-    /// Start of Selected Area to be  as charsent to auxiliary output device
+    /// Start of Selected Area to be sent to auxiliary output device
     pub const SSA: u8 = 0x86;
     /// End of Selected Area to be sent to auxiliary output device
     pub const ESA: u8 = 0x87;
@@ -1102,7 +1330,7 @@ pub mod C1 {
     pub const SGCI: u8 = 0x99;
     /// DECID - Identify Terminal
     pub const DECID: u8 = 0x9a;
-    /// Control Sequence Introducer (described in a seperate table)
+    /// Control Sequence Introducer
     pub const CSI: u8 = 0x9B;
     /// String Terminator (VT125 exits graphics)
     pub const ST: u8 = 0x9C;
@@ -1121,7 +1349,7 @@ pub mod C1 {
 mod tests {
     use std::io;
     use index::{Line, Column};
-    use super::{Processor, Handler, Attr, TermInfo, Color, StandardCharset, CharsetIndex};
+    use super::{Processor, Handler, Attr, TermInfo, Color, StandardCharset, CharsetIndex, parse_rgb_color, parse_number};
     use ::Rgb;
 
     /// The /dev/null of io::Write
@@ -1288,5 +1516,30 @@ mod tests {
         parser.advance(&mut handler, BYTES[3], &mut Void);
 
         assert_eq!(handler.index, CharsetIndex::G1);
+    }
+
+    #[test]
+    fn parse_valid_rgb_color() {
+        assert_eq!(parse_rgb_color(b"rgb:11/aa/ff"), Some(Rgb { r: 0x11, g: 0xaa, b: 0xff }));
+    }
+
+    #[test]
+    fn parse_valid_rgb_color2() {
+        assert_eq!(parse_rgb_color(b"#11aaff"), Some(Rgb { r: 0x11, g: 0xaa, b: 0xff }));
+    }
+
+    #[test]
+    fn parse_invalid_number() {
+        assert_eq!(parse_number(b"1abc"), None);
+    }
+
+    #[test]
+    fn parse_valid_number() {
+        assert_eq!(parse_number(b"123"), Some(123));
+    }
+
+    #[test]
+    fn parse_number_too_large() {
+        assert_eq!(parse_number(b"321"), None);
     }
 }

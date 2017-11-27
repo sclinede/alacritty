@@ -7,7 +7,10 @@ use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 
 use mio::{self, Events, PollOpt, Ready};
+#[cfg(unix)]
+use mio::unix::UnixReady;
 use mio::unix::EventedFd;
+use mio_more::channel::{self, Sender, Receiver};
 
 use ansi;
 use display;
@@ -21,6 +24,9 @@ use sync::FairMutex;
 pub enum Msg {
     /// Data that should be written to the pty
     Input(Cow<'static, [u8]>),
+
+    /// Indicates that the `EventLoop` should shut down, as Alacritty is shutting down
+    Shutdown
 }
 
 /// The main event!.. loop.
@@ -30,8 +36,8 @@ pub enum Msg {
 pub struct EventLoop<Io> {
     poll: mio::Poll,
     pty: Io,
-    rx: mio::channel::Receiver<Msg>,
-    tx: mio::channel::Sender<Msg>,
+    rx: Receiver<Msg>,
+    tx: Sender<Msg>,
     terminal: Arc<FairMutex<Term>>,
     display: display::Notifier,
     ref_test: bool,
@@ -41,6 +47,26 @@ pub struct EventLoop<Io> {
 struct Writing {
     source: Cow<'static, [u8]>,
     written: usize,
+}
+
+/// Indicates the result of draining the mio channel
+#[derive(Debug)]
+enum DrainResult {
+    /// At least one new item was received
+    ReceivedItem,
+    /// Nothing was available to receive
+    Empty,
+    /// A shutdown message was received
+    Shutdown
+}
+
+impl DrainResult {
+    pub fn is_shutdown(&self) -> bool {
+        match *self {
+            DrainResult::Shutdown => true,
+            _ => false
+        }
+    }
 }
 
 /// All of the mutable state needed to run the event loop
@@ -53,13 +79,17 @@ pub struct State {
     parser: ansi::Processor,
 }
 
-pub struct Notifier(pub ::mio::channel::Sender<Msg>);
+pub struct Notifier(pub Sender<Msg>);
 
 impl event::Notify for Notifier {
     fn notify<B>(&mut self, bytes: B)
         where B: Into<Cow<'static, [u8]>>
     {
         let bytes = bytes.into();
+        // terminal hangs if we send 0 bytes through.
+        if bytes.len() == 0 {
+            return
+        }
         match self.0.send(Msg::Input(bytes)) {
             Ok(_) => (),
             Err(_) => panic!("expected send event loop msg"),
@@ -147,7 +177,7 @@ impl<Io> EventLoop<Io>
         pty: Io,
         ref_test: bool,
     ) -> EventLoop<Io> {
-        let (tx, rx) = ::mio::channel::channel();
+        let (tx, rx) = channel::channel();
         EventLoop {
             poll: mio::Poll::new().expect("create mio Poll"),
             pty: pty,
@@ -159,30 +189,41 @@ impl<Io> EventLoop<Io>
         }
     }
 
-    pub fn channel(&self) -> mio::channel::Sender<Msg> {
+    pub fn channel(&self) -> Sender<Msg> {
         self.tx.clone()
     }
 
     // Drain the channel
     //
-    // Returns true if items were received
-    fn drain_recv_channel(&self, state: &mut State) -> bool {
+    // Returns a `DrainResult` indicating the result of receiving from the channel
+    //
+    fn drain_recv_channel(&self, state: &mut State) -> DrainResult {
         let mut received_item = false;
         while let Ok(msg) = self.rx.try_recv() {
             received_item = true;
             match msg {
                 Msg::Input(input) => {
                     state.write_list.push_back(input);
+                },
+                Msg::Shutdown => {
+                    return DrainResult::Shutdown;
                 }
             }
         }
 
-        received_item
+        if received_item {
+            DrainResult::ReceivedItem
+        } else {
+            DrainResult::Empty
+        }
     }
 
+    // Returns a `bool` indicating whether or not the event loop should continue running
     #[inline]
-    fn channel_event(&mut self, state: &mut State) {
-        self.drain_recv_channel(state);
+    fn channel_event(&mut self, state: &mut State) -> bool {
+        if self.drain_recv_channel(state).is_shutdown() {
+            return false;
+        }
 
         self.poll.reregister(
             &self.rx, CHANNEL,
@@ -198,6 +239,8 @@ impl<Io> EventLoop<Io>
                 PollOpt::edge() | PollOpt::oneshot()
             ).expect("reregister fd after channel recv");
         }
+
+        true
     }
 
     #[inline]
@@ -206,58 +249,70 @@ impl<Io> EventLoop<Io>
         state: &mut State,
         buf: &mut [u8],
         mut writer: Option<&mut W>
-    )
+    ) -> io::Result<()>
         where W: Write
     {
+        const MAX_READ: usize = 65_536;
+        let mut processed = 0;
+        let mut terminal = None;
+
         loop {
             match self.pty.read(&mut buf[..]) {
                 Ok(0) => break,
                 Ok(got) => {
+                    // Record bytes read; used to limit time spent in pty_read.
+                    processed += got;
+
+                    // Send a copy of bytes read to a subscriber. Used for
+                    // example with ref test recording.
                     writer = writer.map(|w| {
-                        w.write_all(&buf[..got]).unwrap(); w
+                        w.write_all(&buf[..got]).unwrap();
+                        w
                     });
 
-                    let mut terminal = self.terminal.lock();
+                    // Get reference to terminal. Lock is acquired on initial
+                    // iteration and held until there's no bytes left to parse
+                    // or we've reached MAX_READ.
+                    if terminal.is_none() {
+                        terminal = Some(self.terminal.lock());
+                    }
+                    let terminal = terminal.as_mut().unwrap();
+
+                    // Run the parser
                     for byte in &buf[..got] {
-                        state.parser.advance(&mut *terminal, *byte, &mut self.pty);
+                        state.parser.advance(&mut **terminal, *byte, &mut self.pty);
                     }
 
-                    // Only request a draw if one hasn't already been requested.
-                    //
-                    // This is a performance optimization even if only for X11
-                    // which is very expensive to hammer on the even loop wakeup
-                    if !terminal.dirty {
-                        self.display.notify();
-                        terminal.dirty = true;
-
-                        // Break for writing
-                        //
-                        // Want to prevent case where reading always returns
-                        // data and sequences like `C-c` cannot be sent.
-                        //
-                        // Doing this check in !terminal.dirty will prevent the
-                        // condition from being checked overzealously.
-                        if state.writing.is_some()
-                            || !state.write_list.is_empty()
-                            || self.drain_recv_channel(state)
-                        {
-                            break;
-                        }
+                    // Exit if we've processed enough bytes
+                    if processed > MAX_READ {
+                        break;
                     }
                 },
                 Err(err) => {
                     match err.kind() {
                         ErrorKind::Interrupted |
-                        ErrorKind::WouldBlock => break,
-                        _ => panic!("unexpected read err: {:?}", err),
+                        ErrorKind::WouldBlock => {
+                            break;
+                        },
+                        _ => return Err(err),
                     }
                 }
             }
         }
+
+        // Only request a draw if one hasn't already been requested.
+        if let Some(mut terminal) = terminal {
+            if !terminal.dirty {
+                self.display.notify();
+                terminal.dirty = true;
+            }
+        }
+
+        Ok(())
     }
 
     #[inline]
-    fn pty_write(&mut self, state: &mut State) {
+    fn pty_write(&mut self, state: &mut State) -> io::Result<()> {
         state.ensure_next();
 
         'write_many: while let Some(mut current) = state.take_current() {
@@ -279,14 +334,15 @@ impl<Io> EventLoop<Io>
                         match err.kind() {
                             ErrorKind::Interrupted |
                             ErrorKind::WouldBlock => break 'write_many,
-                            // TODO
-                            _ => panic!("unexpected err: {:?}", err),
+                            _ => return Err(err),
                         }
                     }
                 }
 
             }
         }
+
+        Ok(())
     }
 
     pub fn spawn(
@@ -325,23 +381,38 @@ impl<Io> EventLoop<Io>
 
                 for event in events.iter() {
                     match event.token() {
-                        CHANNEL => self.channel_event(&mut state),
+                        CHANNEL =>  {
+                            if !self.channel_event(&mut state) {
+                                break 'event_loop;
+                            }
+                        },
                         PTY => {
-                            let kind = event.kind();
+                            let ready = event.readiness();
 
-                            if kind.is_readable() {
-                                self.pty_read(&mut state, &mut buf, pipe.as_mut());
+                            #[cfg(unix)] {
+                                if UnixReady::from(ready).is_hup() {
+                                    break 'event_loop;
+                                }
+                            }
+
+                            if ready.is_readable() {
+                                if let Err(err) = self.pty_read(&mut state, &mut buf, pipe.as_mut()) {
+                                    error!("Event loop exitting due to error: {} [{}:{}]",
+                                           err, file!(), line!());
+                                    break 'event_loop;
+                                }
+
                                 if ::tty::process_should_exit() {
                                     break 'event_loop;
                                 }
                             }
 
-                            if kind.is_writable() {
-                                self.pty_write(&mut state);
-                            }
-
-                            if kind.is_hup() {
-                                break 'event_loop;
+                            if ready.is_writable() {
+                                if let Err(err) = self.pty_write(&mut state) {
+                                    error!("Event loop exitting due to error: {} [{}:{}]",
+                                           err, file!(), line!());
+                                    break 'event_loop;
+                                }
                             }
 
                             // Figure out pty interest

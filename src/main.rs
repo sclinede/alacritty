@@ -29,7 +29,7 @@ use alacritty::cli;
 use alacritty::config::{self, Config};
 use alacritty::display::Display;
 use alacritty::event;
-use alacritty::event_loop::{self, EventLoop};
+use alacritty::event_loop::{self, EventLoop, Msg};
 use alacritty::logging;
 use alacritty::sync::FairMutex;
 use alacritty::term::{Term};
@@ -37,28 +37,9 @@ use alacritty::tty::{self, process_should_exit};
 use alacritty::util::fmt::Red;
 
 fn main() {
-
-    // Load configuration
-    let config = Config::load().unwrap_or_else(|err| {
-        match err {
-            // Use default config when not found
-            config::Error::NotFound => {
-                match Config::write_defaults() {
-                    Ok(path) => err_println!("Config file not found; write defaults config to {:?}", path),
-                    Err(err) => err_println!("Write defaults config failure: {}", err)
-                }
-
-                Config::load().unwrap()
-            },
-
-            // If there's a problem with the config file, print an error
-            // and exit.
-            _ => die!("{}", err),
-        }
-    });
-
-    // Load command line options
+    // Load command line options and config
     let options = cli::Options::load();
+    let config = load_config(&options);
 
     // Run alacritty
     if let Err(err) = run(config, options) {
@@ -68,6 +49,32 @@ fn main() {
     info!("Goodbye.");
 }
 
+/// Load configuration
+///
+/// If a configuration file is given as a command line argument we don't
+/// generate a default file. If an empty configuration file is given, i.e.
+/// /dev/null, we load the compiled-in defaults.
+fn load_config(options: &cli::Options) -> Config {
+    let config_path = options.config_path()
+        .or_else(|| Config::installed_config())
+        .unwrap_or_else(|| {
+            Config::write_defaults()
+                .unwrap_or_else(|err| die!("Write defaults config failure: {}", err))
+        });
+
+    Config::load_from(&*config_path).unwrap_or_else(|err| {
+        match err {
+            config::Error::NotFound => {
+                die!("Config file not found at: {}", config_path.display());
+            },
+            config::Error::Empty => {
+                eprintln!("Empty config; Loading defaults");
+                Config::default()
+            },
+            _ => die!("{}", err),
+        }
+    })
+}
 
 /// Run Alacritty
 ///
@@ -78,6 +85,9 @@ fn run(mut config: Config, options: cli::Options) -> Result<(), Box<Error>> {
     logging::initialize(&options)?;
 
     info!("Welcome to Alacritty.");
+    config.path().map(|config_path| {
+        info!("Configuration loaded from {}", config_path.display());
+    });
 
     // Create a display.
     //
@@ -98,12 +108,15 @@ fn run(mut config: Config, options: cli::Options) -> Result<(), Box<Error>> {
     let terminal = Term::new(&config, display.size().to_owned());
     let terminal = Arc::new(FairMutex::new(terminal));
 
+    // Find the window ID for setting $WINDOWID
+    let window_id = display.get_window_id();
+
     // Create the pty
     //
     // The pty forks a process to run the shell on the slave side of the
     // pseudoterminal. A file descriptor for the master side is retained for
     // reading/writing to the shell.
-    let mut pty = tty::new(&config, &options, display.size());
+    let mut pty = tty::new(&config, &options, display.size(), window_id);
 
     // Create the pseudoterminal I/O loop
     //
@@ -112,7 +125,7 @@ fn run(mut config: Config, options: cli::Options) -> Result<(), Box<Error>> {
     // synchronized since the I/O loop updates the state, and the display
     // consumes it periodically.
     let event_loop = EventLoop::new(
-        terminal.clone(),
+        Arc::clone(&terminal),
         display.notifier(),
         pty.reader(),
         options.ref_test,
@@ -126,7 +139,7 @@ fn run(mut config: Config, options: cli::Options) -> Result<(), Box<Error>> {
     //
     // Need the Rc<RefCell<_>> here since a ref is shared in the resize callback
     let mut processor = event::Processor::new(
-        event_loop::Notifier(loop_tx),
+        event_loop::Notifier(event_loop.channel()),
         display.resize_channel(),
         &options,
         &config,
@@ -138,8 +151,15 @@ fn run(mut config: Config, options: cli::Options) -> Result<(), Box<Error>> {
     //
     // The monitor watches the config file for changes and reloads it. Pending
     // config changes are processed in the main loop.
-    let config_monitor = config.path()
-        .map(|path| config::Monitor::new(path, display.notifier()));
+    let config_monitor = match (options.live_config_reload, config.live_config_reload()) {
+        // Start monitor if CLI flag says yes
+        (Some(true), _) |
+        // Or if no CLI flag was passed and the config says yes
+        (None, true) => config.path()
+                .map(|path| config::Monitor::new(path, display.notifier())),
+        // Otherwise, don't start the monitor
+        _ => None,
+    };
 
     // Kick off the I/O thread
     let io_thread = event_loop.spawn(None);
@@ -162,14 +182,16 @@ fn run(mut config: Config, options: cli::Options) -> Result<(), Box<Error>> {
 
         // Maybe draw the terminal
         if terminal.needs_draw() {
+            // Try to update the position of the input method editor
+            display.update_ime_position(&terminal);
             // Handle pending resize events
             //
             // The second argument is a list of types that want to be notified
             // of display size changes.
-            display.handle_resize(&mut terminal, &mut [&mut pty, &mut processor]);
+            display.handle_resize(&mut terminal, &config, &mut [&mut pty, &mut processor]);
 
             // Draw the current state of the terminal
-            display.draw(terminal, &config, &processor.selection);
+            display.draw(terminal, &config, processor.selection.as_ref());
         }
 
         // Begin shutdown if the flag was raised.
@@ -177,6 +199,8 @@ fn run(mut config: Config, options: cli::Options) -> Result<(), Box<Error>> {
             break;
         }
     }
+
+    loop_tx.send(Msg::Shutdown).expect("Error sending shutdown to event loop");
 
     // FIXME patch notify library to have a shutdown method
     // config_reloader.join().ok();

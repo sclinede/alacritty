@@ -4,14 +4,16 @@ use std::fmt;
 use {Rgb, ansi};
 use config::Colors;
 
+pub const COUNT: usize = 268;
+
 /// List of indexed colors
 ///
 /// The first 16 entries are the standard ansi named colors. Items 16..232 are
-/// the color cube.  Items 233..256 are the grayscale ramp. Finally, item 256 is
+/// the color cube.  Items 233..256 are the grayscale ramp. Item 256 is
 /// the configured foreground color, item 257 is the configured background
 /// color, item 258 is the cursor foreground color, item 259 is the cursor
-/// background color.
-pub struct List([Rgb; 260]);
+/// background color. Following that are 8 positions for dim colors.
+pub struct List([Rgb; COUNT]);
 
 impl<'a> From<&'a Colors> for List {
     fn from(colors: &Colors) -> List {
@@ -55,6 +57,32 @@ impl List {
         // Foreground and background for custom cursor colors
         self[ansi::NamedColor::CursorText] = colors.cursor.text;
         self[ansi::NamedColor::Cursor]     = colors.cursor.cursor;
+
+        // Dims
+        match colors.dim {
+            Some(ref dim) => {
+                trace!("Using config-provided dim colors");
+                self[ansi::NamedColor::DimBlack]   = dim.black;
+                self[ansi::NamedColor::DimRed]     = dim.red;
+                self[ansi::NamedColor::DimGreen]   = dim.green;
+                self[ansi::NamedColor::DimYellow]  = dim.yellow;
+                self[ansi::NamedColor::DimBlue]    = dim.blue;
+                self[ansi::NamedColor::DimMagenta] = dim.magenta;
+                self[ansi::NamedColor::DimCyan]    = dim.cyan;
+                self[ansi::NamedColor::DimWhite]   = dim.white;
+            }
+            None => {
+                trace!("Deriving dim colors from normal colors");
+                self[ansi::NamedColor::DimBlack]   = colors.normal.black   * 0.66;
+                self[ansi::NamedColor::DimRed]     = colors.normal.red     * 0.66;
+                self[ansi::NamedColor::DimGreen]   = colors.normal.green   * 0.66;
+                self[ansi::NamedColor::DimYellow]  = colors.normal.yellow  * 0.66;
+                self[ansi::NamedColor::DimBlue]    = colors.normal.blue    * 0.66;
+                self[ansi::NamedColor::DimMagenta] = colors.normal.magenta * 0.66;
+                self[ansi::NamedColor::DimCyan]    = colors.normal.cyan    * 0.66;
+                self[ansi::NamedColor::DimWhite]   = colors.normal.white   * 0.66;
+            }
+        }
     }
 
     fn fill_cube(&mut self) {

@@ -15,26 +15,31 @@
 //! Alacritty - The GPU Enhanced Terminal
 #![cfg_attr(feature = "clippy", feature(plugin))]
 #![cfg_attr(feature = "clippy", plugin(clippy))]
-#![cfg_attr(feature = "clippy", deny(clippy))]
 #![cfg_attr(feature = "clippy", deny(enum_glob_use))]
 #![cfg_attr(feature = "clippy", deny(if_not_else))]
 #![cfg_attr(feature = "clippy", deny(wrong_pub_self_convention))]
 #![cfg_attr(feature = "nightly", feature(core_intrinsics))]
+#![cfg_attr(all(test, feature = "bench"), feature(test))]
 
 #[macro_use] extern crate bitflags;
 #[macro_use] extern crate clap;
-#[macro_use] extern crate lazy_static;
 #[macro_use] extern crate log;
 #[macro_use] extern crate serde_derive;
 
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os="dragonfly", target_os="openbsd"))]
+extern crate x11_dl;
+
+extern crate arraydeque;
 extern crate cgmath;
 extern crate copypasta;
 extern crate errno;
+extern crate env_logger;
 extern crate fnv;
 extern crate font;
 extern crate glutin;
 extern crate libc;
 extern crate mio;
+extern crate mio_more;
 extern crate notify;
 extern crate parking_lot;
 extern crate serde;
@@ -66,6 +71,8 @@ pub mod tty;
 pub mod util;
 pub mod window;
 
+use std::ops::Mul;
+
 pub use grid::Grid;
 pub use term::Term;
 
@@ -76,9 +83,33 @@ pub struct Rgb {
     pub b: u8,
 }
 
+// a multiply function for Rgb, as the default dim is just *2/3
+impl Mul<f32> for Rgb {
+    type Output = Rgb;
+
+    fn mul(self, rhs: f32) -> Rgb {
+        let result = Rgb {
+            r: (self.r as f32 * rhs).max(0.0).min(255.0) as u8,
+            g: (self.g as f32 * rhs).max(0.0).min(255.0) as u8,
+            b: (self.b as f32 * rhs).max(0.0).min(255.0) as u8
+        };
+
+        trace!("Scaling RGB by {} from {:?} to {:?}", rhs, self, result);
+
+        result
+    }
+}
+
+
 #[cfg_attr(feature = "clippy", allow(too_many_arguments))]
 #[cfg_attr(feature = "clippy", allow(doc_markdown))]
+#[cfg_attr(feature = "clippy", allow(unreadable_literal))]
 pub mod gl {
     #![allow(non_upper_case_globals)]
     include!(concat!(env!("OUT_DIR"), "/gl_bindings.rs"));
+}
+
+#[allow(dead_code)]
+mod built_info {
+    include!(concat!(env!("OUT_DIR"), "/built.rs"));
 }

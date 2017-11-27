@@ -30,12 +30,14 @@ extern crate core_foundation;
 extern crate core_foundation_sys;
 #[cfg(target_os = "macos")]
 extern crate core_graphics;
-
+#[cfg(target_os = "macos")]
 extern crate euclid;
+
 extern crate libc;
 
+#[cfg(not(target_os = "macos"))]
 #[macro_use]
-extern crate ffi_util;
+extern crate foreign_types;
 
 #[macro_use]
 extern crate log;
@@ -46,7 +48,7 @@ use std::sync::atomic::{AtomicUsize, ATOMIC_USIZE_INIT, Ordering};
 
 // If target isn't macos, reexport everything from ft
 #[cfg(not(target_os = "macos"))]
-mod ft;
+pub mod ft;
 #[cfg(not(target_os = "macos"))]
 pub use ft::{FreeTypeRasterizer as Rasterizer, Error};
 
@@ -170,6 +172,14 @@ impl Size {
     }
 }
 
+impl ::std::ops::Add for Size {
+    type Output = Size;
+
+    fn add(self, other: Size) -> Size {
+        Size(self.0.saturating_add(other.0))
+    }
+}
+
 pub struct RasterizedGlyph {
     pub c: char,
     pub width: i32,
@@ -219,6 +229,7 @@ impl fmt::Debug for RasterizedGlyph {
 pub struct Metrics {
     pub average_advance: f64,
     pub line_height: f64,
+    pub descent: f32,
 }
 
 pub trait Rasterize {
@@ -226,11 +237,11 @@ pub trait Rasterize {
     type Err: ::std::error::Error + Send + Sync + 'static;
 
     /// Create a new Rasterize
-    fn new(dpi_x: f32, dpi_y: f32, device_pixel_ratio: f32, use_thin_strokes: bool) -> Result<Self, Self::Err>
+    fn new(device_pixel_ratio: f32, use_thin_strokes: bool) -> Result<Self, Self::Err>
         where Self: Sized;
 
-    /// Get `Metrics` for the given `FontKey` and `Size`
-    fn metrics(&self, FontKey, Size) -> Result<Metrics, Self::Err>;
+    /// Get `Metrics` for the given `FontKey`
+    fn metrics(&self, FontKey) -> Result<Metrics, Self::Err>;
 
     /// Load the font described by `FontDesc` and `Size`
     fn load_font(&mut self, &FontDesc, Size) -> Result<FontKey, Self::Err>;

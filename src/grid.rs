@@ -30,7 +30,7 @@ use index::{self, Point, Line, Column, IndexRange, RangeInclusive};
 
 /// Convert a type to a linear index range.
 pub trait ToRange {
-    fn to_range(&self, columns: index::Column) -> RangeInclusive<index::Linear>;
+    fn to_range(&self) -> RangeInclusive<index::Linear>;
 }
 
 /// Bidirection iterator
@@ -146,21 +146,21 @@ impl<T> Grid<T> {
         self.cols
     }
 
+    pub fn iter_rows(&self) -> slice::Iter<Row<T>> {
+        self.raw.iter()
+    }
+
     #[inline]
     pub fn scroll_down(&mut self, region: Range<index::Line>, positions: index::Line) {
-        for line in IndexRange(region).rev() {
-            let src = line;
-            let dst = line - positions;
-            self.swap_lines(src, dst);
+        for line in IndexRange((region.start + positions)..region.end).rev() {
+            self.swap_lines(line, line - positions);
         }
     }
 
     #[inline]
     pub fn scroll_up(&mut self, region: Range<index::Line>, positions: index::Line) {
-        for line in IndexRange(region) {
-            let src = line;
-            let dst = line + positions;
-            self.swap_lines(src, dst);
+        for line in IndexRange(region.start..(region.end - positions)) {
+            self.swap_lines(line, line + positions);
         }
     }
 
@@ -334,6 +334,16 @@ impl<T> Row<T> {
     }
 }
 
+impl<'a, T> IntoIterator for &'a Grid<T> {
+    type Item = &'a Row<T>;
+    type IntoIter = slice::Iter<'a, Row<T>>;
+
+    #[inline]
+    fn into_iter(self) -> slice::Iter<'a, Row<T>> {
+        self.raw.iter()
+    }
+}
+
 impl<'a, T> IntoIterator for &'a Row<T> {
     type Item = &'a T;
     type IntoIter = slice::Iter<'a, T>;
@@ -349,7 +359,7 @@ impl<'a, T> IntoIterator for &'a mut Row<T> {
     type IntoIter = slice::IterMut<'a, T>;
 
     #[inline]
-    fn into_iter(mut self) -> slice::IterMut<'a, T> {
+    fn into_iter(self) -> slice::IterMut<'a, T> {
         self.iter_mut()
     }
 }
@@ -608,7 +618,7 @@ mod tests {
 
         info!("grid: {:?}", grid);
 
-        grid.scroll_up(Line(0)..Line(8), Line(2));
+        grid.scroll_up(Line(0)..Line(10), Line(2));
 
         info!("grid: {:?}", grid);
 
@@ -642,7 +652,7 @@ mod tests {
 
         info!("grid: {:?}", grid);
 
-        grid.scroll_down(Line(2)..Line(10), Line(2));
+        grid.scroll_down(Line(0)..Line(10), Line(2));
 
         info!("grid: {:?}", grid);
 

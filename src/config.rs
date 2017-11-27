@@ -18,8 +18,10 @@ use font::Size;
 use serde_yaml;
 use serde::{self, de, Deserialize};
 use serde::de::Error as SerdeError;
-use serde::de::{Visitor, MapVisitor, Unexpected};
-use notify::{Watcher as WatcherApi, RecommendedWatcher as FileWatcher, op};
+use serde::de::{Visitor, MapAccess, Unexpected};
+use notify::{Watcher, watcher, DebouncedEvent, RecursiveMode};
+
+use glutin::ModifiersState;
 
 use input::{Action, Binding, MouseBinding, KeyBinding};
 use index::{Line, Column};
@@ -50,8 +52,8 @@ pub struct ClickHandler {
     pub threshold: Duration,
 }
 
-fn deserialize_duration_ms<D>(deserializer: D) -> ::std::result::Result<Duration, D::Error>
-    where D: de::Deserializer
+fn deserialize_duration_ms<'a, D>(deserializer: D) -> ::std::result::Result<Duration, D::Error>
+    where D: de::Deserializer<'a>
 {
     let threshold_ms = u64::deserialize(deserializer)?;
     Ok(Duration::from_millis(threshold_ms))
@@ -77,7 +79,7 @@ impl Default for Mouse {
     }
 }
 
-/// VisulBellAnimations are modeled after a subset of CSS transitions and Robert
+/// `VisualBellAnimations` are modeled after a subset of CSS transitions and Robert
 /// Penner's Easing Functions.
 #[derive(Clone, Copy, Debug, Deserialize)]
 pub enum VisualBellAnimation {
@@ -171,6 +173,41 @@ impl<'a> Shell<'a> {
     }
 }
 
+/// Wrapper around f32 that represents an alpha value between 0.0 and 1.0
+#[derive(Clone, Copy, Debug)]
+pub struct Alpha(f32);
+
+impl Alpha {
+    pub fn new(value: f32) -> Self {
+        Alpha(Self::clamp_to_valid_range(value))
+    }
+
+    pub fn set(&mut self, value: f32) {
+        self.0 = Self::clamp_to_valid_range(value);
+    }
+
+    #[inline(always)]
+    pub fn get(&self) -> f32 {
+        self.0
+    }
+
+    fn clamp_to_valid_range(value: f32) -> f32 {
+        if value < 0.0 {
+            0.0
+        } else if value > 1.0 {
+            1.0
+        } else {
+            value
+        }
+    }
+}
+
+impl Default for Alpha {
+    fn default() -> Self {
+        Alpha(1.0)
+    }
+}
+
 /// Top-level config type
 #[derive(Debug, Deserialize)]
 pub struct Config {
@@ -182,9 +219,9 @@ pub struct Config {
     #[serde(default)]
     dimensions: Dimensions,
 
-    /// Pixels per inch
-    #[serde(default)]
-    dpi: Dpi,
+    /// Pixel padding
+    #[serde(default="default_padding")]
+    padding: Delta,
 
     /// Font configuration
     #[serde(default)]
@@ -198,12 +235,16 @@ pub struct Config {
     #[serde(default)]
     custom_cursor_colors: bool,
 
-    /// Should draw bold text with brighter colors intead of bold font
+    /// Should draw bold text with brighter colors instead of bold font
     #[serde(default="true_bool")]
     draw_bold_text_with_bright_colors: bool,
 
     #[serde(default)]
     colors: Colors,
+
+    /// Background opacity from 0.0 to 1.0
+    #[serde(default)]
+    background_opacity: Alpha,
 
     /// Keybindings
     #[serde(default="default_key_bindings")]
@@ -233,6 +274,14 @@ pub struct Config {
     /// Hide cursor when typing
     #[serde(default)]
     hide_cursor_when_typing: bool,
+
+    /// Live config reload
+    #[serde(default="true_bool")]
+    live_config_reload: bool,
+}
+
+fn default_padding() -> Delta {
+    Delta { x: 2., y: 2. }
 }
 
 #[cfg(not(target_os="macos"))]
@@ -266,11 +315,11 @@ impl Default for Config {
         Config {
             draw_bold_text_with_bright_colors: true,
             dimensions: Default::default(),
-            dpi: Default::default(),
             font: Default::default(),
             render_timer: Default::default(),
             custom_cursor_colors: false,
             colors: Default::default(),
+            background_opacity: Default::default(),
             key_bindings: Vec::new(),
             mouse_bindings: Vec::new(),
             selection: Default::default(),
@@ -280,6 +329,8 @@ impl Default for Config {
             visual_bell: Default::default(),
             env: Default::default(),
             hide_cursor_when_typing: Default::default(),
+            live_config_reload: true,
+            padding: default_padding(),
         }
     }
 }
@@ -288,21 +339,21 @@ impl Default for Config {
 ///
 /// Our deserialize impl wouldn't be covered by a derive(Deserialize); see the
 /// impl below.
-struct ModsWrapper(::glutin::Mods);
+struct ModsWrapper(ModifiersState);
 
 impl ModsWrapper {
-    fn into_inner(self) -> ::glutin::Mods {
+    fn into_inner(self) -> ModifiersState {
         self.0
     }
 }
 
-impl de::Deserialize for ModsWrapper {
+impl<'a> de::Deserialize<'a> for ModsWrapper {
     fn deserialize<D>(deserializer: D) -> ::std::result::Result<Self, D::Error>
-        where D: de::Deserializer
+        where D: de::Deserializer<'a>
     {
         struct ModsVisitor;
 
-        impl Visitor for ModsVisitor {
+        impl<'a> Visitor<'a> for ModsVisitor {
             type Value = ModsWrapper;
 
             fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -312,15 +363,14 @@ impl de::Deserialize for ModsWrapper {
             fn visit_str<E>(self, value: &str) -> ::std::result::Result<ModsWrapper, E>
                 where E: de::Error,
             {
-                use ::glutin::{mods, Mods};
-                let mut res = Mods::empty();
+                let mut res = ModifiersState::default();
                 for modifier in value.split('|') {
                     match modifier.trim() {
-                        "Command" | "Super" => res |= mods::SUPER,
-                        "Shift" => res |= mods::SHIFT,
-                        "Alt" | "Option" => res |= mods::ALT,
-                        "Control" => res |= mods::CONTROL,
-                        _ => err_println!("unknown modifier {:?}", modifier),
+                        "Command" | "Super" => res.logo = true,
+                        "Shift" => res.shift = true,
+                        "Alt" | "Option" => res.alt = true,
+                        "Control" => res.ctrl = true,
+                        _ => eprintln!("unknown modifier {:?}", modifier),
                     }
                 }
 
@@ -340,17 +390,17 @@ impl ActionWrapper {
     }
 }
 
-impl de::Deserialize for ActionWrapper {
+impl<'a> de::Deserialize<'a> for ActionWrapper {
     fn deserialize<D>(deserializer: D) -> ::std::result::Result<Self, D::Error>
-        where D: de::Deserializer
+        where D: de::Deserializer<'a>
     {
         struct ActionVisitor;
 
-        impl Visitor for ActionVisitor {
+        impl<'a> Visitor<'a> for ActionVisitor {
             type Value = ActionWrapper;
 
             fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                f.write_str("Paste, Copy, PasteSelection, or Quit")
+                f.write_str("Paste, Copy, PasteSelection, IncreaseFontSize, DecreaseFontSize, ResetFontSize, or Quit")
             }
 
             fn visit_str<E>(self, value: &str) -> ::std::result::Result<ActionWrapper, E>
@@ -360,6 +410,9 @@ impl de::Deserialize for ActionWrapper {
                     "Paste" => Action::Paste,
                     "Copy" => Action::Copy,
                     "PasteSelection" => Action::PasteSelection,
+                    "IncreaseFontSize" => Action::IncreaseFontSize,
+                    "DecreaseFontSize" => Action::DecreaseFontSize,
+                    "ResetFontSize" => Action::ResetFontSize,
                     "Quit" => Action::Quit,
                     _ => return Err(E::invalid_value(Unexpected::Str(value), &self)),
                 }))
@@ -369,6 +422,17 @@ impl de::Deserialize for ActionWrapper {
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum CommandWrapper {
+    Just(String),
+    WithArgs {
+        program: String,
+        #[serde(default)]
+        args: Vec<String>,
+    },
+}
+
 use ::term::{mode, TermMode};
 
 struct ModeWrapper {
@@ -376,13 +440,13 @@ struct ModeWrapper {
     pub not_mode: TermMode,
 }
 
-impl de::Deserialize for ModeWrapper {
+impl<'a> de::Deserialize<'a> for ModeWrapper {
     fn deserialize<D>(deserializer:  D) -> ::std::result::Result<Self, D::Error>
-        where D: de::Deserializer
+        where D: de::Deserializer<'a>
     {
         struct ModeVisitor;
 
-        impl Visitor for ModeVisitor {
+        impl<'a> Visitor<'a> for ModeVisitor {
             type Value = ModeWrapper;
 
             fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -403,7 +467,7 @@ impl de::Deserialize for ModeWrapper {
                         "~AppCursor" => res.not_mode |= mode::APP_CURSOR,
                         "AppKeypad" => res.mode |= mode::APP_KEYPAD,
                         "~AppKeypad" => res.not_mode |= mode::APP_KEYPAD,
-                        _ => err_println!("unknown omde {:?}", modifier),
+                        _ => eprintln!("unknown mode {:?}", modifier),
                     }
                 }
 
@@ -422,13 +486,13 @@ impl MouseButton {
     }
 }
 
-impl de::Deserialize for MouseButton {
+impl<'a> de::Deserialize<'a> for MouseButton {
     fn deserialize<D>(deserializer: D) -> ::std::result::Result<Self, D::Error>
-        where D: de::Deserializer
+        where D: de::Deserializer<'a>
     {
         struct MouseButtonVisitor;
 
-        impl Visitor for MouseButtonVisitor {
+        impl<'a> Visitor<'a> for MouseButtonVisitor {
             type Value = MouseButton;
 
             fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -462,7 +526,7 @@ impl de::Deserialize for MouseButton {
 struct RawBinding {
     key: Option<::glutin::VirtualKeyCode>,
     mouse: Option<::glutin::MouseButton>,
-    mods: ::glutin::Mods,
+    mods: ModifiersState,
     mode: TermMode,
     notmode: TermMode,
     action: Action,
@@ -498,9 +562,9 @@ impl RawBinding {
     }
 }
 
-impl de::Deserialize for RawBinding {
+impl<'a> de::Deserialize<'a> for RawBinding {
     fn deserialize<D>(deserializer: D) -> ::std::result::Result<Self, D::Error>
-        where D: de::Deserializer
+        where D: de::Deserializer<'a>
     {
         enum Field {
             Key,
@@ -508,20 +572,21 @@ impl de::Deserialize for RawBinding {
             Mode,
             Action,
             Chars,
-            Mouse
+            Mouse,
+            Command,
         }
 
-        impl de::Deserialize for Field {
+        impl<'a> de::Deserialize<'a> for Field {
             fn deserialize<D>(deserializer: D) -> ::std::result::Result<Field, D::Error>
-                where D: de::Deserializer
+                where D: de::Deserializer<'a>
             {
                 struct FieldVisitor;
 
                 static FIELDS: &'static [&'static str] = &[
-                        "key", "mods", "mode", "action", "chars", "mouse"
+                        "key", "mods", "mode", "action", "chars", "mouse", "command",
                 ];
 
-                impl Visitor for FieldVisitor {
+                impl<'a> Visitor<'a> for FieldVisitor {
                     type Value = Field;
 
                     fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -538,17 +603,18 @@ impl de::Deserialize for RawBinding {
                             "action" => Ok(Field::Action),
                             "chars" => Ok(Field::Chars),
                             "mouse" => Ok(Field::Mouse),
+                            "command" => Ok(Field::Command),
                             _ => Err(E::unknown_field(value, FIELDS)),
                         }
                     }
                 }
 
-                deserializer.deserialize_struct_field(FieldVisitor)
+                deserializer.deserialize_struct("Field", FIELDS, FieldVisitor)
             }
         }
 
         struct RawBindingVisitor;
-        impl Visitor for RawBindingVisitor {
+        impl<'a> Visitor<'a> for RawBindingVisitor {
             type Value = RawBinding;
 
             fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -557,28 +623,29 @@ impl de::Deserialize for RawBinding {
 
             fn visit_map<V>(
                 self,
-                mut visitor: V
+                mut map: V
             ) -> ::std::result::Result<RawBinding, V::Error>
-                where V: MapVisitor,
+                where V: MapAccess<'a>,
             {
-                let mut mods: Option<::glutin::Mods> = None;
+                let mut mods: Option<ModifiersState> = None;
                 let mut key: Option<::glutin::VirtualKeyCode> = None;
                 let mut chars: Option<String> = None;
                 let mut action: Option<::input::Action> = None;
                 let mut mode: Option<TermMode> = None;
                 let mut not_mode: Option<TermMode> = None;
                 let mut mouse: Option<::glutin::MouseButton> = None;
+                let mut command: Option<CommandWrapper> = None;
 
                 use ::serde::de::Error;
 
-                while let Some(struct_key) = visitor.visit_key::<Field>()? {
+                while let Some(struct_key) = map.next_key::<Field>()? {
                     match struct_key {
                         Field::Key => {
                             if key.is_some() {
                                 return Err(<V::Error as Error>::duplicate_field("key"));
                             }
 
-                            let coherent_key = visitor.visit_value::<Key>()?;
+                            let coherent_key = map.next_value::<Key>()?;
                             key = Some(coherent_key.to_glutin_key());
                         },
                         Field::Mods => {
@@ -586,14 +653,14 @@ impl de::Deserialize for RawBinding {
                                 return Err(<V::Error as Error>::duplicate_field("mods"));
                             }
 
-                            mods = Some(visitor.visit_value::<ModsWrapper>()?.into_inner());
+                            mods = Some(map.next_value::<ModsWrapper>()?.into_inner());
                         },
                         Field::Mode => {
                             if mode.is_some() {
                                 return Err(<V::Error as Error>::duplicate_field("mode"));
                             }
 
-                            let mode_deserializer = visitor.visit_value::<ModeWrapper>()?;
+                            let mode_deserializer = map.next_value::<ModeWrapper>()?;
                             mode = Some(mode_deserializer.mode);
                             not_mode = Some(mode_deserializer.not_mode);
                         },
@@ -602,37 +669,52 @@ impl de::Deserialize for RawBinding {
                                 return Err(<V::Error as Error>::duplicate_field("action"));
                             }
 
-                            action = Some(visitor.visit_value::<ActionWrapper>()?.into_inner());
+                            action = Some(map.next_value::<ActionWrapper>()?.into_inner());
                         },
                         Field::Chars => {
                             if chars.is_some() {
                                 return Err(<V::Error as Error>::duplicate_field("chars"));
                             }
 
-                            chars = Some(visitor.visit_value()?);
+                            chars = Some(map.next_value()?);
                         },
                         Field::Mouse => {
                             if chars.is_some() {
                                 return Err(<V::Error as Error>::duplicate_field("mouse"));
                             }
 
-                            mouse = Some(visitor.visit_value::<MouseButton>()?.into_inner());
-                        }
+                            mouse = Some(map.next_value::<MouseButton>()?.into_inner());
+                        },
+                        Field::Command => {
+                            if command.is_some() {
+                                return Err(<V::Error as Error>::duplicate_field("command"));
+                            }
+
+                            command = Some(map.next_value::<CommandWrapper>()?);
+                        },
                     }
                 }
 
-                let action = match (action, chars) {
-                    (Some(_), Some(_)) => {
-                        return Err(V::Error::custom("must specify only chars or action"));
+                let action = match (action, chars, command) {
+                    (Some(action), None, None) => action,
+                    (None, Some(chars), None) => Action::Esc(chars),
+                    (None, None, Some(cmd)) => {
+                        match cmd {
+                            CommandWrapper::Just(program) => {
+                                Action::Command(program, vec![])
+                            },
+                            CommandWrapper::WithArgs { program, args } => {
+                                Action::Command(program, args)
+                            },
+                        }
                     },
-                    (Some(action), _) => action,
-                    (_, Some(chars)) => Action::Esc(chars),
-                    _ => return Err(V::Error::custom("must specify chars or action"))
+                    (None, None, None) => return Err(V::Error::custom("must specify chars, action or command")),
+                    _ => return Err(V::Error::custom("must specify only chars, action or command")),
                 };
 
                 let mode = mode.unwrap_or_else(TermMode::empty);
                 let not_mode = not_mode.unwrap_or_else(TermMode::empty);
-                let mods = mods.unwrap_or_else(::glutin::Mods::empty);
+                let mods = mods.unwrap_or_else(ModifiersState::default);
 
                 if mouse.is_none() && key.is_none() {
                     return Err(V::Error::custom("bindings require mouse button or key"));
@@ -650,16 +732,26 @@ impl de::Deserialize for RawBinding {
         }
 
         const FIELDS: &'static [&'static str] = &[
-            "key", "mods", "mode", "action", "chars", "mouse"
+            "key", "mods", "mode", "action", "chars", "mouse", "command",
         ];
 
         deserializer.deserialize_struct("RawBinding", FIELDS, RawBindingVisitor)
     }
 }
 
-impl de::Deserialize for MouseBinding {
+
+impl<'a> de::Deserialize<'a> for Alpha {
     fn deserialize<D>(deserializer: D) -> ::std::result::Result<Self, D::Error>
-        where D: de::Deserializer
+        where D: de::Deserializer<'a>
+    {
+        let value = f32::deserialize(deserializer)?;
+        Ok(Alpha::new(value))
+    }
+}
+
+impl<'a> de::Deserialize<'a> for MouseBinding {
+    fn deserialize<D>(deserializer: D) -> ::std::result::Result<Self, D::Error>
+        where D: de::Deserializer<'a>
     {
         let raw = RawBinding::deserialize(deserializer)?;
         raw.into_mouse_binding()
@@ -667,9 +759,9 @@ impl de::Deserialize for MouseBinding {
     }
 }
 
-impl de::Deserialize for KeyBinding {
+impl<'a> de::Deserialize<'a> for KeyBinding {
     fn deserialize<D>(deserializer: D) -> ::std::result::Result<Self, D::Error>
-        where D: de::Deserializer
+        where D: de::Deserializer<'a>
     {
         let raw = RawBinding::deserialize(deserializer)?;
         raw.into_key_binding()
@@ -682,6 +774,9 @@ impl de::Deserialize for KeyBinding {
 pub enum Error {
     /// Config file not found
     NotFound,
+
+    /// Config file empty
+    Empty,
 
     /// Couldn't read $HOME environment variable
     ReadingEnvHome(env::VarError),
@@ -700,10 +795,11 @@ pub struct Colors {
     pub cursor: CursorColors,
     pub normal: AnsiColors,
     pub bright: AnsiColors,
+    pub dim: Option<AnsiColors>,
 }
 
-fn deserialize_cursor_colors<D>(deserializer: D) -> ::std::result::Result<CursorColors, D::Error>
-    where D: de::Deserializer
+fn deserialize_cursor_colors<'a, D>(deserializer: D) -> ::std::result::Result<CursorColors, D::Error>
+    where D: de::Deserializer<'a>
 {
     let either = CursorOrPrimaryColors::deserialize(deserializer)?;
     Ok(either.into_cursor_colors())
@@ -797,12 +893,13 @@ impl Default for Colors {
                 magenta: Rgb {r: 0xb7, g: 0x7e, b: 0xe0},
                 cyan: Rgb {r: 0x54, g: 0xce, b: 0xd6},
                 white: Rgb {r: 0xff, g: 0xff, b: 0xff},
-            }
+            },
+            dim: None,
         }
     }
 }
 
-/// The normal or bright colors section of config
+/// The 8-colors sections of config
 #[derive(Debug, Deserialize)]
 pub struct AnsiColors {
     #[serde(deserialize_with = "rgb_from_hex")]
@@ -827,12 +924,12 @@ pub struct AnsiColors {
 ///
 /// This is *not* the deserialize impl for Rgb since we want a symmetric
 /// serialize/deserialize impl for ref tests.
-fn rgb_from_hex<D>(deserializer: D) -> ::std::result::Result<Rgb, D::Error>
-    where D: de::Deserializer
+fn rgb_from_hex<'a, D>(deserializer: D) -> ::std::result::Result<Rgb, D::Error>
+    where D: de::Deserializer<'a>
 {
     struct RgbVisitor;
 
-    impl ::serde::de::Visitor for RgbVisitor {
+    impl<'a> Visitor<'a> for RgbVisitor {
         type Value = Rgb;
 
         fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -872,8 +969,11 @@ impl FromStr for Rgb {
             }
         }
 
-        if chars.next().unwrap() != '0' { return Err(()); }
-        if chars.next().unwrap() != 'x' { return Err(()); }
+        match chars.next().unwrap() {
+            '0' => if chars.next().unwrap() != 'x' { return Err(()); },
+            '#' => (),
+            _ => return Err(()),
+        }
 
         component!(r, g, b);
 
@@ -885,6 +985,7 @@ impl ::std::error::Error for Error {
     fn cause(&self) -> Option<&::std::error::Error> {
         match *self {
             Error::NotFound => None,
+            Error::Empty => None,
             Error::ReadingEnvHome(ref err) => Some(err),
             Error::Io(ref err) => Some(err),
             Error::Yaml(ref err) => Some(err),
@@ -894,6 +995,7 @@ impl ::std::error::Error for Error {
     fn description(&self) -> &str {
         match *self {
             Error::NotFound => "could not locate config file",
+            Error::Empty => "empty config file",
             Error::ReadingEnvHome(ref err) => err.description(),
             Error::Io(ref err) => err.description(),
             Error::Yaml(ref err) => err.description(),
@@ -905,6 +1007,7 @@ impl ::std::fmt::Display for Error {
     fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
         match *self {
             Error::NotFound => write!(f, "{}", ::std::error::Error::description(self)),
+            Error::Empty => write!(f, "{}", ::std::error::Error::description(self)),
             Error::ReadingEnvHome(ref err) => {
                 write!(f, "could not read $HOME environment variable: {}", err)
             },
@@ -940,19 +1043,16 @@ impl From<serde_yaml::Error> for Error {
 pub type Result<T> = ::std::result::Result<T, Error>;
 
 impl Config {
-    /// Attempt to load the config file
-    ///
-    /// The config file is loaded from the first file it finds in this list of paths
+    /// Get the location of the first found default config file paths
+    /// according to the following order:
     ///
     /// 1. $XDG_CONFIG_HOME/alacritty/alacritty.yml
     /// 2. $XDG_CONFIG_HOME/alacritty.yml
     /// 3. $HOME/.config/alacritty/alacritty.yml
     /// 4. $HOME/.alacritty.yml
-    pub fn load() -> Result<Config> {
-        let home = env::var("HOME")?;
-
+    pub fn installed_config() -> Option<Cow<'static, Path>> {
         // Try using XDG location by default
-        let path = ::xdg::BaseDirectories::with_prefix("alacritty")
+        ::xdg::BaseDirectories::with_prefix("alacritty")
             .ok()
             .and_then(|xdg| xdg.find_config_file("alacritty.yml"))
             .or_else(|| {
@@ -961,27 +1061,29 @@ impl Config {
                 })
             })
             .or_else(|| {
-                // Fallback path: $HOME/.config/alacritty/alacritty.yml
-                let fallback = PathBuf::from(&home).join(".config/alacritty/alacritty.yml");
-                match fallback.exists() {
-                    true => Some(fallback),
-                    false => None
+                if let Ok(home) = env::var("HOME") {
+                    // Fallback path: $HOME/.config/alacritty/alacritty.yml
+                    let fallback = PathBuf::from(&home).join(".config/alacritty/alacritty.yml");
+                    if fallback.exists() {
+                        return Some(fallback);
+                    }
+                    // Fallback path: $HOME/.alacritty.yml
+                    let fallback = PathBuf::from(&home).join(".alacritty.yml");
+                    if fallback.exists() {
+                        return Some(fallback);
+                    }
                 }
+                None
             })
-            .unwrap_or_else(|| {
-                // Fallback path: $HOME/.alacritty.yml
-                PathBuf::from(&home).join(".alacritty.yml")
-            });
-
-        Config::load_from(path)
+            .map(|path| path.into())
     }
 
-    pub fn write_defaults() -> io::Result<PathBuf> {
+    pub fn write_defaults() -> io::Result<Cow<'static, Path>> {
         let path = ::xdg::BaseDirectories::with_prefix("alacritty")
             .map_err(|err| io::Error::new(io::ErrorKind::NotFound, ::std::error::Error::description(&err)))
             .and_then(|p| p.place_config_file("alacritty.yml"))?;
         File::create(&path)?.write_all(DEFAULT_ALACRITTY_CONFIG.as_bytes())?;
-        Ok(path)
+        Ok(path.into())
     }
 
     /// Get list of colors
@@ -990,6 +1092,11 @@ impl Config {
     /// array for performance.
     pub fn colors(&self) -> &Colors {
         &self.colors
+    }
+
+    #[inline]
+    pub fn background_opacity(&self) -> Alpha {
+        self.background_opacity
     }
 
     pub fn key_bindings(&self) -> &[KeyBinding] {
@@ -1008,6 +1115,10 @@ impl Config {
         &self.selection
     }
 
+    pub fn padding(&self) -> &Delta {
+        &self.padding
+    }
+
     #[inline]
     pub fn draw_bold_text_with_bright_colors(&self) -> bool {
         self.draw_bold_text_with_bright_colors
@@ -1023,12 +1134,6 @@ impl Config {
     #[inline]
     pub fn dimensions(&self) -> Dimensions {
         self.dimensions
-    }
-
-    /// Get dpi config
-    #[inline]
-    pub fn dpi(&self) -> &Dpi {
-        &self.dpi
     }
 
     /// Get visual bell config
@@ -1074,7 +1179,13 @@ impl Config {
         self.hide_cursor_when_typing
     }
 
-    fn load_from<P: Into<PathBuf>>(path: P) -> Result<Config> {
+    /// Live config reload
+    #[inline]
+    pub fn live_config_reload(&self) -> bool {
+        self.live_config_reload
+    }
+
+    pub fn load_from<P: Into<PathBuf>>(path: P) -> Result<Config> {
         let path = path.into();
         let raw = Config::read_file(path.as_path())?;
         let mut config: Config = serde_yaml::from_str(&raw)?;
@@ -1087,6 +1198,9 @@ impl Config {
         let mut f = fs::File::open(path)?;
         let mut contents = String::new();
         f.read_to_string(&mut contents)?;
+        if contents.len() == 0 {
+            return Err(Error::Empty);
+        }
 
         Ok(contents)
     }
@@ -1131,86 +1245,43 @@ impl Dimensions {
     }
 }
 
-/// Pixels per inch
-///
-/// This is only used on `FreeType` systems
-#[derive(Debug, Deserialize)]
-pub struct Dpi {
-    /// Horizontal dpi
-    x: f32,
-
-    /// Vertical dpi
-    y: f32,
+/// A delta for a point in a 2 dimensional plane
+#[derive(Clone, Copy, Debug, Deserialize)]
+pub struct Delta {
+    /// Horizontal change
+    pub x: f32,
+    /// Vertical change
+    pub y: f32,
 }
 
-impl Default for Dpi {
-    fn default() -> Dpi {
-        Dpi { x: 96.0, y: 96.0 }
+impl Default for Delta {
+    fn default() -> Delta {
+        Delta { x: 0.0, y: 0.0 }
     }
 }
 
-impl Dpi {
-    /// Get horizontal dpi
-    #[inline]
-    pub fn x(&self) -> f32 {
-        self.x
-    }
-
-    /// Get vertical dpi
-    #[inline]
-    pub fn y(&self) -> f32 {
-        self.y
-    }
+trait DeserializeSize : Sized {
+    fn deserialize<'a, D>(D) -> ::std::result::Result<Self, D::Error>
+        where D: serde::de::Deserializer<'a>;
 }
 
-/// Modifications to font spacing
-///
-/// The way Alacritty calculates vertical and horizontal cell sizes may not be
-/// ideal for all fonts. This gives the user a way to tweak those values.
-#[derive(Debug, Deserialize)]
-pub struct FontOffset {
-    /// Extra horizontal spacing between letters
-    x: f32,
-    /// Extra vertical spacing between lines
-    y: f32,
-}
-
-impl FontOffset {
-    /// Get letter spacing
-    #[inline]
-    pub fn x(&self) -> f32 {
-        self.x
-    }
-
-    /// Get line spacing
-    #[inline]
-    pub fn y(&self) -> f32 {
-        self.y
-    }
-}
-
-trait DeserializeFromF32 : Sized {
-    fn deserialize_from_f32<D>(D) -> ::std::result::Result<Self, D::Error>
-        where D: serde::de::Deserializer;
-}
-
-impl DeserializeFromF32 for Size {
-    fn deserialize_from_f32<D>(deserializer: D) -> ::std::result::Result<Self, D::Error>
-        where D: serde::de::Deserializer
+impl DeserializeSize for Size {
+    fn deserialize<'a, D>(deserializer: D) -> ::std::result::Result<Self, D::Error>
+        where D: serde::de::Deserializer<'a>
     {
         use std::marker::PhantomData;
 
-        struct FloatVisitor<__D> {
+        struct NumVisitor<__D> {
             _marker: PhantomData<__D>,
         }
 
-        impl<__D> ::serde::de::Visitor for FloatVisitor<__D>
-            where __D: ::serde::de::Deserializer
+        impl<'a, __D> Visitor<'a> for NumVisitor<__D>
+            where __D: serde::de::Deserializer<'a>
         {
             type Value = f64;
 
             fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                f.write_str("f64")
+                f.write_str("f64 or u64")
             }
 
             fn visit_f64<E>(self, value: f64) -> ::std::result::Result<Self::Value, E>
@@ -1218,10 +1289,16 @@ impl DeserializeFromF32 for Size {
             {
                 Ok(value)
             }
+
+            fn visit_u64<E>(self, value: u64) -> ::std::result::Result<Self::Value, E>
+                where E: ::serde::de::Error
+            {
+                Ok(value as f64)
+            }
         }
 
         deserializer
-            .deserialize_f64(FloatVisitor::<D>{ _marker: PhantomData })
+            .deserialize_any(NumVisitor::<D>{ _marker: PhantomData })
             .map(|v| Size::new(v as _))
     }
 }
@@ -1232,7 +1309,7 @@ impl DeserializeFromF32 for Size {
 /// field in this struct. It might be nice in the future to have defaults for
 /// each value independently. Alternatively, maybe erroring when the user
 /// doesn't provide complete config is Ok.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Font {
     /// Font family
     pub normal: FontDescription,
@@ -1244,11 +1321,15 @@ pub struct Font {
     pub bold: FontDescription,
 
     // Font size in points
-    #[serde(deserialize_with="DeserializeFromF32::deserialize_from_f32")]
-    size: Size,
+    #[serde(deserialize_with="DeserializeSize::deserialize")]
+    pub size: Size,
 
     /// Extra spacing per character
-    offset: FontOffset,
+    offset: Delta,
+
+    /// Glyph offset within character cell
+    #[serde(default)]
+    glyph_offset: Delta,
 
     #[serde(default="true_bool")]
     use_thin_strokes: bool
@@ -1263,7 +1344,7 @@ fn default_italic_desc() -> FontDescription {
 }
 
 /// Description of a single font
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct FontDescription {
     pub family: String,
     pub style: Option<String>,
@@ -1287,8 +1368,26 @@ impl Font {
 
     /// Get offsets to font metrics
     #[inline]
-    pub fn offset(&self) -> &FontOffset {
+    pub fn offset(&self) -> &Delta {
         &self.offset
+    }
+
+    /// Get cell offsets for glyphs
+    #[inline]
+    pub fn glyph_offset(&self) -> &Delta {
+        &self.glyph_offset
+    }
+
+    /// Get a font clone with a size modification
+    pub fn with_size_delta(self, delta: f32) -> Font {
+        let mut new_size = self.size.as_f32_pts() + delta;
+        if new_size < 1.0 {
+            new_size = 1.0;
+        }
+        Font {
+            size : Size::new(new_size),
+            .. self
+        }
     }
 }
 
@@ -1301,10 +1400,8 @@ impl Default for Font {
             italic: FontDescription::new_with_family("Menlo"),
             size: Size::new(11.0),
             use_thin_strokes: true,
-            offset: FontOffset {
-                x: 0.0,
-                y: 0.0
-            }
+            offset: Default::default(),
+            glyph_offset: Default::default()
         }
     }
 }
@@ -1318,12 +1415,8 @@ impl Default for Font {
             italic: FontDescription::new_with_family("monospace"),
             size: Size::new(11.0),
             use_thin_strokes: false,
-            offset: FontOffset {
-                // TODO should improve freetype metrics... shouldn't need such
-                // drastic offsets for the default!
-                x: 2.0,
-                y: -7.0
-            }
+            offset: Default::default(),
+            glyph_offset: Default::default()
         }
     }
 }
@@ -1364,43 +1457,36 @@ impl Monitor {
         Monitor {
             _thread: ::util::thread::spawn_named("config watcher", move || {
                 let (tx, rx) = mpsc::channel();
-                let mut watcher = FileWatcher::new(tx).unwrap();
-                watcher.watch(&path).expect("watch alacritty yml");
+                // The Duration argument is a debouncing period.
+                let mut watcher = watcher(tx, Duration::from_millis(10)).unwrap();
+                let config_path = ::std::fs::canonicalize(path)
+                    .expect("canonicalize config path");
 
-                let config_path = path.as_path();
+                // Get directory of config
+                let mut parent = config_path.clone();
+                parent.pop();
+
+                // Watch directory
+                watcher.watch(&parent, RecursiveMode::NonRecursive)
+                    .expect("watch alacritty.yml dir");
 
                 loop {
-                    let event = rx.recv().expect("watcher event");
-                    let ::notify::Event { path, op } = event;
-
-                    if let Ok(op) = op {
-                        // Skip events that are just a rename
-                        if op.contains(op::RENAME) && !op.contains(op::WRITE) {
-                            continue;
-                        }
-
-                        // Need to handle ignore for linux
-                        if op.contains(op::IGNORED) {
-                            if let Some(path) = path.as_ref() {
-                                if let Err(err) = watcher.watch(&path) {
-                                    err_println!("failed to establish watch on {:?}: {:?}",
-                                                 path, err);
-                                }
-                            }
-                        }
-
-                        // Reload file
-                        path.map(|path| {
+                    match rx.recv().expect("watcher event") {
+                        DebouncedEvent::Rename(_, _) => continue,
+                        DebouncedEvent::Write(path) | DebouncedEvent::Create(path)
+                         | DebouncedEvent::Chmod(path) => {
+                            // Reload file
                             if path == config_path {
-                                match Config::load() {
+                                match Config::load_from(path) {
                                     Ok(config) => {
                                         let _ = config_tx.send(config);
                                         handler.on_config_reload();
                                     },
-                                    Err(err) => err_println!("Ignoring invalid config: {}", err),
+                                    Err(err) => eprintln!("Ignoring invalid config: {}", err),
                                 }
-                            }
-                        });
+                             }
+                        }
+                        _ => {}
                     }
                 }
             }),
@@ -1598,158 +1684,159 @@ enum Key {
 
 impl Key {
     fn to_glutin_key(&self) -> ::glutin::VirtualKeyCode {
+        use ::glutin::VirtualKeyCode::*;
         // Thank you, vim macros!
         match *self {
-            Key::Key1 => ::glutin::VirtualKeyCode::Key1,
-            Key::Key2 => ::glutin::VirtualKeyCode::Key2,
-            Key::Key3 => ::glutin::VirtualKeyCode::Key3,
-            Key::Key4 => ::glutin::VirtualKeyCode::Key4,
-            Key::Key5 => ::glutin::VirtualKeyCode::Key5,
-            Key::Key6 => ::glutin::VirtualKeyCode::Key6,
-            Key::Key7 => ::glutin::VirtualKeyCode::Key7,
-            Key::Key8 => ::glutin::VirtualKeyCode::Key8,
-            Key::Key9 => ::glutin::VirtualKeyCode::Key9,
-            Key::Key0 => ::glutin::VirtualKeyCode::Key0,
-            Key::A => ::glutin::VirtualKeyCode::A,
-            Key::B => ::glutin::VirtualKeyCode::B,
-            Key::C => ::glutin::VirtualKeyCode::C,
-            Key::D => ::glutin::VirtualKeyCode::D,
-            Key::E => ::glutin::VirtualKeyCode::E,
-            Key::F => ::glutin::VirtualKeyCode::F,
-            Key::G => ::glutin::VirtualKeyCode::G,
-            Key::H => ::glutin::VirtualKeyCode::H,
-            Key::I => ::glutin::VirtualKeyCode::I,
-            Key::J => ::glutin::VirtualKeyCode::J,
-            Key::K => ::glutin::VirtualKeyCode::K,
-            Key::L => ::glutin::VirtualKeyCode::L,
-            Key::M => ::glutin::VirtualKeyCode::M,
-            Key::N => ::glutin::VirtualKeyCode::N,
-            Key::O => ::glutin::VirtualKeyCode::O,
-            Key::P => ::glutin::VirtualKeyCode::P,
-            Key::Q => ::glutin::VirtualKeyCode::Q,
-            Key::R => ::glutin::VirtualKeyCode::R,
-            Key::S => ::glutin::VirtualKeyCode::S,
-            Key::T => ::glutin::VirtualKeyCode::T,
-            Key::U => ::glutin::VirtualKeyCode::U,
-            Key::V => ::glutin::VirtualKeyCode::V,
-            Key::W => ::glutin::VirtualKeyCode::W,
-            Key::X => ::glutin::VirtualKeyCode::X,
-            Key::Y => ::glutin::VirtualKeyCode::Y,
-            Key::Z => ::glutin::VirtualKeyCode::Z,
-            Key::Escape => ::glutin::VirtualKeyCode::Escape,
-            Key::F1 => ::glutin::VirtualKeyCode::F1,
-            Key::F2 => ::glutin::VirtualKeyCode::F2,
-            Key::F3 => ::glutin::VirtualKeyCode::F3,
-            Key::F4 => ::glutin::VirtualKeyCode::F4,
-            Key::F5 => ::glutin::VirtualKeyCode::F5,
-            Key::F6 => ::glutin::VirtualKeyCode::F6,
-            Key::F7 => ::glutin::VirtualKeyCode::F7,
-            Key::F8 => ::glutin::VirtualKeyCode::F8,
-            Key::F9 => ::glutin::VirtualKeyCode::F9,
-            Key::F10 => ::glutin::VirtualKeyCode::F10,
-            Key::F11 => ::glutin::VirtualKeyCode::F11,
-            Key::F12 => ::glutin::VirtualKeyCode::F12,
-            Key::F13 => ::glutin::VirtualKeyCode::F13,
-            Key::F14 => ::glutin::VirtualKeyCode::F14,
-            Key::F15 => ::glutin::VirtualKeyCode::F15,
-            Key::Snapshot => ::glutin::VirtualKeyCode::Snapshot,
-            Key::Scroll => ::glutin::VirtualKeyCode::Scroll,
-            Key::Pause => ::glutin::VirtualKeyCode::Pause,
-            Key::Insert => ::glutin::VirtualKeyCode::Insert,
-            Key::Home => ::glutin::VirtualKeyCode::Home,
-            Key::Delete => ::glutin::VirtualKeyCode::Delete,
-            Key::End => ::glutin::VirtualKeyCode::End,
-            Key::PageDown => ::glutin::VirtualKeyCode::PageDown,
-            Key::PageUp => ::glutin::VirtualKeyCode::PageUp,
-            Key::Left => ::glutin::VirtualKeyCode::Left,
-            Key::Up => ::glutin::VirtualKeyCode::Up,
-            Key::Right => ::glutin::VirtualKeyCode::Right,
-            Key::Down => ::glutin::VirtualKeyCode::Down,
-            Key::Back => ::glutin::VirtualKeyCode::Back,
-            Key::Return => ::glutin::VirtualKeyCode::Return,
-            Key::Space => ::glutin::VirtualKeyCode::Space,
-            Key::Compose => ::glutin::VirtualKeyCode::Compose,
-            Key::Numlock => ::glutin::VirtualKeyCode::Numlock,
-            Key::Numpad0 => ::glutin::VirtualKeyCode::Numpad0,
-            Key::Numpad1 => ::glutin::VirtualKeyCode::Numpad1,
-            Key::Numpad2 => ::glutin::VirtualKeyCode::Numpad2,
-            Key::Numpad3 => ::glutin::VirtualKeyCode::Numpad3,
-            Key::Numpad4 => ::glutin::VirtualKeyCode::Numpad4,
-            Key::Numpad5 => ::glutin::VirtualKeyCode::Numpad5,
-            Key::Numpad6 => ::glutin::VirtualKeyCode::Numpad6,
-            Key::Numpad7 => ::glutin::VirtualKeyCode::Numpad7,
-            Key::Numpad8 => ::glutin::VirtualKeyCode::Numpad8,
-            Key::Numpad9 => ::glutin::VirtualKeyCode::Numpad9,
-            Key::AbntC1 => ::glutin::VirtualKeyCode::AbntC1,
-            Key::AbntC2 => ::glutin::VirtualKeyCode::AbntC2,
-            Key::Add => ::glutin::VirtualKeyCode::Add,
-            Key::Apostrophe => ::glutin::VirtualKeyCode::Apostrophe,
-            Key::Apps => ::glutin::VirtualKeyCode::Apps,
-            Key::At => ::glutin::VirtualKeyCode::At,
-            Key::Ax => ::glutin::VirtualKeyCode::Ax,
-            Key::Backslash => ::glutin::VirtualKeyCode::Backslash,
-            Key::Calculator => ::glutin::VirtualKeyCode::Calculator,
-            Key::Capital => ::glutin::VirtualKeyCode::Capital,
-            Key::Colon => ::glutin::VirtualKeyCode::Colon,
-            Key::Comma => ::glutin::VirtualKeyCode::Comma,
-            Key::Convert => ::glutin::VirtualKeyCode::Convert,
-            Key::Decimal => ::glutin::VirtualKeyCode::Decimal,
-            Key::Divide => ::glutin::VirtualKeyCode::Divide,
-            Key::Equals => ::glutin::VirtualKeyCode::Equals,
-            Key::Grave => ::glutin::VirtualKeyCode::Grave,
-            Key::Kana => ::glutin::VirtualKeyCode::Kana,
-            Key::Kanji => ::glutin::VirtualKeyCode::Kanji,
-            Key::LAlt => ::glutin::VirtualKeyCode::LAlt,
-            Key::LBracket => ::glutin::VirtualKeyCode::LBracket,
-            Key::LControl => ::glutin::VirtualKeyCode::LControl,
-            Key::LMenu => ::glutin::VirtualKeyCode::LMenu,
-            Key::LShift => ::glutin::VirtualKeyCode::LShift,
-            Key::LWin => ::glutin::VirtualKeyCode::LWin,
-            Key::Mail => ::glutin::VirtualKeyCode::Mail,
-            Key::MediaSelect => ::glutin::VirtualKeyCode::MediaSelect,
-            Key::MediaStop => ::glutin::VirtualKeyCode::MediaStop,
-            Key::Minus => ::glutin::VirtualKeyCode::Minus,
-            Key::Multiply => ::glutin::VirtualKeyCode::Multiply,
-            Key::Mute => ::glutin::VirtualKeyCode::Mute,
-            Key::MyComputer => ::glutin::VirtualKeyCode::MyComputer,
-            Key::NavigateForward => ::glutin::VirtualKeyCode::NavigateForward,
-            Key::NavigateBackward => ::glutin::VirtualKeyCode::NavigateBackward,
-            Key::NextTrack => ::glutin::VirtualKeyCode::NextTrack,
-            Key::NoConvert => ::glutin::VirtualKeyCode::NoConvert,
-            Key::NumpadComma => ::glutin::VirtualKeyCode::NumpadComma,
-            Key::NumpadEnter => ::glutin::VirtualKeyCode::NumpadEnter,
-            Key::NumpadEquals => ::glutin::VirtualKeyCode::NumpadEquals,
-            Key::OEM102 => ::glutin::VirtualKeyCode::OEM102,
-            Key::Period => ::glutin::VirtualKeyCode::Period,
-            Key::PlayPause => ::glutin::VirtualKeyCode::PlayPause,
-            Key::Power => ::glutin::VirtualKeyCode::Power,
-            Key::PrevTrack => ::glutin::VirtualKeyCode::PrevTrack,
-            Key::RAlt => ::glutin::VirtualKeyCode::RAlt,
-            Key::RBracket => ::glutin::VirtualKeyCode::RBracket,
-            Key::RControl => ::glutin::VirtualKeyCode::RControl,
-            Key::RMenu => ::glutin::VirtualKeyCode::RMenu,
-            Key::RShift => ::glutin::VirtualKeyCode::RShift,
-            Key::RWin => ::glutin::VirtualKeyCode::RWin,
-            Key::Semicolon => ::glutin::VirtualKeyCode::Semicolon,
-            Key::Slash => ::glutin::VirtualKeyCode::Slash,
-            Key::Sleep => ::glutin::VirtualKeyCode::Sleep,
-            Key::Stop => ::glutin::VirtualKeyCode::Stop,
-            Key::Subtract => ::glutin::VirtualKeyCode::Subtract,
-            Key::Sysrq => ::glutin::VirtualKeyCode::Sysrq,
-            Key::Tab => ::glutin::VirtualKeyCode::Tab,
-            Key::Underline => ::glutin::VirtualKeyCode::Underline,
-            Key::Unlabeled => ::glutin::VirtualKeyCode::Unlabeled,
-            Key::VolumeDown => ::glutin::VirtualKeyCode::VolumeDown,
-            Key::VolumeUp => ::glutin::VirtualKeyCode::VolumeUp,
-            Key::Wake => ::glutin::VirtualKeyCode::Wake,
-            Key::WebBack => ::glutin::VirtualKeyCode::WebBack,
-            Key::WebFavorites => ::glutin::VirtualKeyCode::WebFavorites,
-            Key::WebForward => ::glutin::VirtualKeyCode::WebForward,
-            Key::WebHome => ::glutin::VirtualKeyCode::WebHome,
-            Key::WebRefresh => ::glutin::VirtualKeyCode::WebRefresh,
-            Key::WebSearch => ::glutin::VirtualKeyCode::WebSearch,
-            Key::WebStop => ::glutin::VirtualKeyCode::WebStop,
-            Key::Yen => ::glutin::VirtualKeyCode::Yen,
+            Key::Key1 => Key1,
+            Key::Key2 => Key2,
+            Key::Key3 => Key3,
+            Key::Key4 => Key4,
+            Key::Key5 => Key5,
+            Key::Key6 => Key6,
+            Key::Key7 => Key7,
+            Key::Key8 => Key8,
+            Key::Key9 => Key9,
+            Key::Key0 => Key0,
+            Key::A => A,
+            Key::B => B,
+            Key::C => C,
+            Key::D => D,
+            Key::E => E,
+            Key::F => F,
+            Key::G => G,
+            Key::H => H,
+            Key::I => I,
+            Key::J => J,
+            Key::K => K,
+            Key::L => L,
+            Key::M => M,
+            Key::N => N,
+            Key::O => O,
+            Key::P => P,
+            Key::Q => Q,
+            Key::R => R,
+            Key::S => S,
+            Key::T => T,
+            Key::U => U,
+            Key::V => V,
+            Key::W => W,
+            Key::X => X,
+            Key::Y => Y,
+            Key::Z => Z,
+            Key::Escape => Escape,
+            Key::F1 => F1,
+            Key::F2 => F2,
+            Key::F3 => F3,
+            Key::F4 => F4,
+            Key::F5 => F5,
+            Key::F6 => F6,
+            Key::F7 => F7,
+            Key::F8 => F8,
+            Key::F9 => F9,
+            Key::F10 => F10,
+            Key::F11 => F11,
+            Key::F12 => F12,
+            Key::F13 => F13,
+            Key::F14 => F14,
+            Key::F15 => F15,
+            Key::Snapshot => Snapshot,
+            Key::Scroll => Scroll,
+            Key::Pause => Pause,
+            Key::Insert => Insert,
+            Key::Home => Home,
+            Key::Delete => Delete,
+            Key::End => End,
+            Key::PageDown => PageDown,
+            Key::PageUp => PageUp,
+            Key::Left => Left,
+            Key::Up => Up,
+            Key::Right => Right,
+            Key::Down => Down,
+            Key::Back => Back,
+            Key::Return => Return,
+            Key::Space => Space,
+            Key::Compose => Compose,
+            Key::Numlock => Numlock,
+            Key::Numpad0 => Numpad0,
+            Key::Numpad1 => Numpad1,
+            Key::Numpad2 => Numpad2,
+            Key::Numpad3 => Numpad3,
+            Key::Numpad4 => Numpad4,
+            Key::Numpad5 => Numpad5,
+            Key::Numpad6 => Numpad6,
+            Key::Numpad7 => Numpad7,
+            Key::Numpad8 => Numpad8,
+            Key::Numpad9 => Numpad9,
+            Key::AbntC1 => AbntC1,
+            Key::AbntC2 => AbntC2,
+            Key::Add => Add,
+            Key::Apostrophe => Apostrophe,
+            Key::Apps => Apps,
+            Key::At => At,
+            Key::Ax => Ax,
+            Key::Backslash => Backslash,
+            Key::Calculator => Calculator,
+            Key::Capital => Capital,
+            Key::Colon => Colon,
+            Key::Comma => Comma,
+            Key::Convert => Convert,
+            Key::Decimal => Decimal,
+            Key::Divide => Divide,
+            Key::Equals => Equals,
+            Key::Grave => Grave,
+            Key::Kana => Kana,
+            Key::Kanji => Kanji,
+            Key::LAlt => LAlt,
+            Key::LBracket => LBracket,
+            Key::LControl => LControl,
+            Key::LMenu => LMenu,
+            Key::LShift => LShift,
+            Key::LWin => LWin,
+            Key::Mail => Mail,
+            Key::MediaSelect => MediaSelect,
+            Key::MediaStop => MediaStop,
+            Key::Minus => Minus,
+            Key::Multiply => Multiply,
+            Key::Mute => Mute,
+            Key::MyComputer => MyComputer,
+            Key::NavigateForward => NavigateForward,
+            Key::NavigateBackward => NavigateBackward,
+            Key::NextTrack => NextTrack,
+            Key::NoConvert => NoConvert,
+            Key::NumpadComma => NumpadComma,
+            Key::NumpadEnter => NumpadEnter,
+            Key::NumpadEquals => NumpadEquals,
+            Key::OEM102 => OEM102,
+            Key::Period => Period,
+            Key::PlayPause => PlayPause,
+            Key::Power => Power,
+            Key::PrevTrack => PrevTrack,
+            Key::RAlt => RAlt,
+            Key::RBracket => RBracket,
+            Key::RControl => RControl,
+            Key::RMenu => RMenu,
+            Key::RShift => RShift,
+            Key::RWin => RWin,
+            Key::Semicolon => Semicolon,
+            Key::Slash => Slash,
+            Key::Sleep => Sleep,
+            Key::Stop => Stop,
+            Key::Subtract => Subtract,
+            Key::Sysrq => Sysrq,
+            Key::Tab => Tab,
+            Key::Underline => Underline,
+            Key::Unlabeled => Unlabeled,
+            Key::VolumeDown => VolumeDown,
+            Key::VolumeUp => VolumeUp,
+            Key::Wake => Wake,
+            Key::WebBack => WebBack,
+            Key::WebFavorites => WebFavorites,
+            Key::WebForward => WebForward,
+            Key::WebHome => WebHome,
+            Key::WebRefresh => WebRefresh,
+            Key::WebSearch => WebSearch,
+            Key::WebStop => WebStop,
+            Key::Yen => Yen,
         }
     }
 }

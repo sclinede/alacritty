@@ -17,14 +17,16 @@ use index::Column;
 
 bitflags! {
     #[derive(Serialize, Deserialize)]
-    pub flags Flags: u32 {
-        const INVERSE           = 0b00000001,
-        const BOLD              = 0b00000010,
-        const ITALIC            = 0b00000100,
-        const UNDERLINE         = 0b00001000,
-        const WRAPLINE          = 0b00010000,
-        const WIDE_CHAR         = 0b00100000,
-        const WIDE_CHAR_SPACER  = 0b01000000,
+    pub struct Flags: u32 {
+        const INVERSE           = 0b00000001;
+        const BOLD              = 0b00000010;
+        const ITALIC            = 0b00000100;
+        const UNDERLINE         = 0b00001000;
+        const WRAPLINE          = 0b00010000;
+        const WIDE_CHAR         = 0b00100000;
+        const WIDE_CHAR_SPACER  = 0b01000000;
+        const DIM               = 0b10000000;
+        const DIM_BOLD          = 0b10000010;
     }
 }
 
@@ -73,8 +75,19 @@ impl LineLength for grid::Row<Cell> {
 }
 
 impl Cell {
+    #[inline]
     pub fn bold(&self) -> bool {
         self.flags.contains(BOLD)
+    }
+
+    #[inline]
+    pub fn inverse(&self) -> bool {
+        self.flags.contains(INVERSE)
+    }
+
+    #[inline]
+    pub fn dim(&self) -> bool {
+        self.flags.contains(DIM)
     }
 
     pub fn new(c: char, fg: Color, bg: Color) -> Cell {

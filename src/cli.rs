@@ -12,31 +12,48 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 extern crate log;
+use built_info;
 use clap::{Arg, App};
 use index::{Line, Column};
 use config::{Dimensions, Shell};
+use std::path::{Path, PathBuf};
+use std::borrow::Cow;
 
 const DEFAULT_TITLE: &'static str = "Alacritty";
 
+fn crate_long_version() -> String {
+    format!("{} (git commit {}) [{} build using {}])",
+        built_info::PKG_VERSION,
+        built_info::GIT_VERSION.unwrap_or(""),
+        built_info::PROFILE,
+        built_info::RUSTC_VERSION)
+}
+
 /// Options specified on the command line
 pub struct Options {
+    pub live_config_reload: Option<bool>,
     pub print_events: bool,
     pub ref_test: bool,
     pub dimensions: Option<Dimensions>,
     pub title: String,
     pub log_level: log::LogLevelFilter,
-    pub shell: Option<Shell<'static>>,
+    pub command: Option<Shell<'static>>,
+    pub working_dir: Option<PathBuf>,
+    pub config: Option<PathBuf>,
 }
 
 impl Default for Options {
     fn default() -> Options {
         Options {
+            live_config_reload: None,
             print_events: false,
             ref_test: false,
             dimensions: None,
             title: DEFAULT_TITLE.to_owned(),
             log_level: log::LogLevelFilter::Warn,
-            shell: None,
+            command: None,
+            working_dir: None,
+            config: None,
         }
     }
 }
@@ -48,18 +65,27 @@ impl Options {
 
         let matches = App::new(crate_name!())
             .version(crate_version!())
+            .long_version(crate_long_version().as_str())
             .author(crate_authors!("\n"))
             .about(crate_description!())
             .arg(Arg::with_name("ref-test")
                 .long("ref-test")
                 .help("Generates ref test"))
+            .arg(Arg::with_name("live-config-reload")
+                .long("live-config-reload")
+                .help("Enable automatic config reloading"))
+            .arg(Arg::with_name("no-live-config-reload")
+                 .long("no-live-config-reload")
+                 .help("Disable automatic config reloading")
+                 .conflicts_with("live-config-reload"))
             .arg(Arg::with_name("print-events")
                 .long("print-events"))
             .arg(Arg::with_name("dimensions")
                 .long("dimensions")
                 .short("d")
                 .value_names(&["columns", "lines"])
-                .help("Defines the window dimensions [default: 80x24]"))
+                .help("Defines the window dimensions. Falls back to size specified by \
+                       window manager if set to 0x0 [default: 80x24]"))
             .arg(Arg::with_name("title")
                 .long("title")
                 .short("t")
@@ -75,7 +101,17 @@ impl Options {
                 .multiple(true)
                 .conflicts_with("q")
                 .help("Increases the level of verbosity (the max level is -vvv)"))
+            .arg(Arg::with_name("working-directory")
+                 .long("working-directory")
+                 .takes_value(true)
+                 .help("Start the shell in the specified working directory"))
+            .arg(Arg::with_name("config-file")
+                 .long("config-file")
+                 .takes_value(true)
+                 .help("Specify alternative configuration file \
+                       [default: $XDG_CONFIG_HOME/alacritty/alacritty.yml]"))
             .arg(Arg::with_name("command")
+                .long("command")
                 .short("e")
                 .multiple(true)
                 .takes_value(true)
@@ -92,9 +128,15 @@ impl Options {
             options.print_events = true;
         }
 
+        if matches.is_present("live-config-reload") {
+            options.live_config_reload = Some(true);
+        } else if matches.is_present("no-live-config-reload") {
+            options.live_config_reload = Some(false);
+        }
+
         if let Some(mut dimensions) = matches.values_of("dimensions") {
-            let width = dimensions.next().map(|w| w.parse().map(|w| Column(w)));
-            let height = dimensions.next().map(|h| h.parse().map(|h| Line(h)));
+            let width = dimensions.next().map(|w| w.parse().map(Column));
+            let height = dimensions.next().map(|h| h.parse().map(Line));
             if let (Some(Ok(width)), Some(Ok(height))) = (width, height) {
                 options.dimensions = Some(Dimensions::new(width, height));
             }
@@ -117,13 +159,21 @@ impl Options {
             3 | _ => options.log_level = log::LogLevelFilter::Trace
         }
 
+        if let Some(dir) = matches.value_of("working-directory") {
+            options.working_dir = Some(PathBuf::from(dir.to_string()));
+        }
+
+        if let Some(path) = matches.value_of("config-file") {
+            options.config = Some(PathBuf::from(path.to_string()));
+        }
+
         if let Some(mut args) = matches.values_of("command") {
             // The following unwrap is guaranteed to succeed.
             // If 'command' exists it must also have a first item since
             // Arg::min_values(1) is set.
             let command = String::from(args.next().unwrap());
             let args = args.map(String::from).collect();
-            options.shell = Some(Shell::new_with_args(command, args));
+            options.command = Some(Shell::new_with_args(command, args));
         }
 
         options
@@ -133,7 +183,11 @@ impl Options {
         self.dimensions
     }
 
-    pub fn shell(&self) -> Option<&Shell> {
-        self.shell.as_ref()
+    pub fn command(&self) -> Option<&Shell> {
+        self.command.as_ref()
+    }
+
+    pub fn config_path(&self) -> Option<Cow<Path>> {
+        self.config.as_ref().map(|p| Cow::Borrowed(p.as_path()))
     }
 }
