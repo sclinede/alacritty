@@ -68,7 +68,7 @@ fn load_config(options: &cli::Options) -> Config {
                 die!("Config file not found at: {}", config_path.display());
             },
             config::Error::Empty => {
-                err_println!("Empty config; Loading defaults");
+                eprintln!("Empty config; Loading defaults");
                 Config::default()
             },
             _ => die!("{}", err),
@@ -85,6 +85,9 @@ fn run(mut config: Config, options: cli::Options) -> Result<(), Box<Error>> {
     logging::initialize(&options)?;
 
     info!("Welcome to Alacritty.");
+    config.path().map(|config_path| {
+        info!("Configuration loaded from {}", config_path.display());
+    });
 
     // Create a display.
     //
@@ -122,7 +125,7 @@ fn run(mut config: Config, options: cli::Options) -> Result<(), Box<Error>> {
     // synchronized since the I/O loop updates the state, and the display
     // consumes it periodically.
     let event_loop = EventLoop::new(
-        terminal.clone(),
+        Arc::clone(&terminal),
         display.notifier(),
         pty.reader(),
         options.ref_test,
@@ -148,8 +151,15 @@ fn run(mut config: Config, options: cli::Options) -> Result<(), Box<Error>> {
     //
     // The monitor watches the config file for changes and reloads it. Pending
     // config changes are processed in the main loop.
-    let config_monitor = config.path()
-        .map(|path| config::Monitor::new(path, display.notifier()));
+    let config_monitor = match (options.live_config_reload, config.live_config_reload()) {
+        // Start monitor if CLI flag says yes
+        (Some(true), _) |
+        // Or if no CLI flag was passed and the config says yes
+        (None, true) => config.path()
+                .map(|path| config::Monitor::new(path, display.notifier())),
+        // Otherwise, don't start the monitor
+        _ => None,
+    };
 
     // Kick off the I/O thread
     let io_thread = event_loop.spawn(None);
@@ -178,7 +188,7 @@ fn run(mut config: Config, options: cli::Options) -> Result<(), Box<Error>> {
             //
             // The second argument is a list of types that want to be notified
             // of display size changes.
-            display.handle_resize(&mut terminal, &mut [&mut pty, &mut processor]);
+            display.handle_resize(&mut terminal, &config, &mut [&mut pty, &mut processor]);
 
             // Draw the current state of the terminal
             display.draw(terminal, &config, processor.selection.as_ref());

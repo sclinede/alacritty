@@ -12,13 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 use std::collections::HashMap;
-use std::hash::BuildHasherDefault;
 use std::fs::File;
+use std::hash::BuildHasherDefault;
 use std::io::{self, Read};
 use std::mem::size_of;
 use std::path::{PathBuf};
 use std::ptr;
 use std::sync::mpsc;
+use std::time::Duration;
 
 use cgmath;
 use fnv::FnvHasher;
@@ -26,7 +27,7 @@ use font::{self, Rasterizer, Rasterize, RasterizedGlyph, FontDesc, GlyphKey, Fon
 use gl::types::*;
 use gl;
 use index::{Line, Column, RangeInclusive};
-use notify::{Watcher as WatcherApi, RecommendedWatcher as Watcher, op};
+use notify::{Watcher, watcher, RecursiveMode, DebouncedEvent};
 
 use config::{self, Config, Delta};
 use term::{self, cell, RenderableCell};
@@ -50,6 +51,11 @@ static TEXT_SHADER_V: &'static str = include_str!(
 pub trait LoadGlyph {
     /// Load the rasterized glyph into GPU memory
     fn load_glyph(&mut self, rasterized: &RasterizedGlyph) -> Glyph;
+
+    /// Clear any state accumulated from previous loaded glyphs
+    ///
+    /// This can, for instance, be used to reset the texture Atlas.
+    fn clear(&mut self);
 }
 
 enum Msg {
@@ -119,8 +125,6 @@ pub struct ShaderProgram {
 
     padding_x: f32,
     padding_y: f32,
-
-    u_bg_opacity: GLint,
 }
 
 
@@ -169,53 +173,12 @@ pub struct GlyphCache {
 impl GlyphCache {
     pub fn new<L>(
         mut rasterizer: Rasterizer,
-        config: &Config,
+        font: &config::Font,
         loader: &mut L
     ) -> Result<GlyphCache, font::Error>
         where L: LoadGlyph
     {
-        let font = config.font();
-        let size = font.size();
-        let glyph_offset = *font.glyph_offset();
-
-        fn make_desc(
-            desc: &config::FontDescription,
-            slant: font::Slant,
-            weight: font::Weight,
-        ) -> FontDesc
-        {
-            let style = if let Some(ref spec) = desc.style {
-                font::Style::Specific(spec.to_owned())
-            } else {
-                font::Style::Description {slant:slant, weight:weight}
-            };
-            FontDesc::new(&desc.family[..], style)
-        }
-
-        // Load regular font
-        let regular_desc = make_desc(&font.normal, font::Slant::Normal, font::Weight::Normal);
-
-        let regular = rasterizer
-            .load_font(&regular_desc, size)?;
-
-        // helper to load a description if it is not the regular_desc
-        let load_or_regular = |desc:FontDesc, rasterizer: &mut Rasterizer| {
-            if desc == regular_desc {
-                regular
-            } else {
-                rasterizer.load_font(&desc, size).unwrap_or_else(|_| regular)
-            }
-        };
-
-        // Load bold font
-        let bold_desc = make_desc(&font.bold, font::Slant::Normal, font::Weight::Bold);
-
-        let bold = load_or_regular(bold_desc, &mut rasterizer);
-
-        // Load italic font
-        let italic_desc = make_desc(&font.italic, font::Slant::Italic, font::Weight::Normal);
-
-        let italic = load_or_regular(italic_desc, &mut rasterizer);
+        let (regular, bold, italic) = Self::compute_font_keys(font, &mut rasterizer)?;
 
         // Need to load at least one glyph for the face before calling metrics.
         // The glyph requested here ('m' at the time of writing) has no special
@@ -230,27 +193,78 @@ impl GlyphCache {
             font_key: regular,
             bold_key: bold,
             italic_key: italic,
-            glyph_offset: glyph_offset,
+            glyph_offset: *font.glyph_offset(),
             metrics: metrics
         };
 
-        macro_rules! load_glyphs_for_font {
-            ($font:expr) => {
-                for i in RangeInclusive::new(32u8, 128u8) {
-                    cache.get(&GlyphKey {
-                        font_key: $font,
-                        c: i as char,
-                        size: font.size()
-                    }, loader);
-                }
-            }
-        }
-
-        load_glyphs_for_font!(regular);
-        load_glyphs_for_font!(bold);
-        load_glyphs_for_font!(italic);
+        cache.load_glyphs_for_font(regular, loader);
+        cache.load_glyphs_for_font(bold, loader);
+        cache.load_glyphs_for_font(italic, loader);
 
         Ok(cache)
+    }
+
+    fn load_glyphs_for_font<L: LoadGlyph>(
+        &mut self,
+        font: FontKey,
+        loader: &mut L,
+    ) {
+        let size = self.font_size;
+        for i in RangeInclusive::new(32u8, 128u8) {
+            self.get(&GlyphKey {
+                font_key: font,
+                c: i as char,
+                size: size
+            }, loader);
+        }
+    }
+
+    /// Computes font keys for (Regular, Bold, Italic)
+    fn compute_font_keys(
+        font: &config::Font,
+        rasterizer: &mut Rasterizer
+    ) -> Result<(FontKey, FontKey, FontKey), font::Error> {
+        let size = font.size();
+
+        // Load regular font
+        let regular_desc = Self::make_desc(&font.normal, font::Slant::Normal, font::Weight::Normal);
+
+        let regular = rasterizer
+            .load_font(&regular_desc, size)?;
+
+        // helper to load a description if it is not the regular_desc
+        let mut load_or_regular = |desc:FontDesc| {
+            if desc == regular_desc {
+                regular
+            } else {
+                rasterizer.load_font(&desc, size).unwrap_or_else(|_| regular)
+            }
+        };
+
+        // Load bold font
+        let bold_desc = Self::make_desc(&font.bold, font::Slant::Normal, font::Weight::Bold);
+
+        let bold = load_or_regular(bold_desc);
+
+        // Load italic font
+        let italic_desc = Self::make_desc(&font.italic, font::Slant::Italic, font::Weight::Normal);
+
+        let italic = load_or_regular(italic_desc);
+
+        Ok((regular, bold, italic))
+    }
+
+    fn make_desc(
+        desc: &config::FontDescription,
+        slant: font::Slant,
+        weight: font::Weight,
+    ) -> FontDesc {
+        let style = if let Some(ref spec) = desc.style {
+            font::Style::Specific(spec.to_owned())
+        } else {
+            font::Style::Description {slant:slant, weight:weight}
+        };
+        FontDesc::new(&desc.family[..], style)
     }
 
     pub fn font_metrics(&self) -> font::Metrics {
@@ -277,6 +291,35 @@ impl GlyphCache {
 
                 loader.load_glyph(&rasterized)
             })
+    }
+    pub fn update_font_size<L: LoadGlyph>(
+        &mut self,
+        font: &config::Font,
+        delta: i8,
+        loader: &mut L
+    ) -> Result<(), font::Error> {
+        // Clear currently cached data in both GL and the registry
+        loader.clear();
+        self.cache = HashMap::default();
+
+        // Recompute font keys
+        let font = font.to_owned().with_size_delta(delta as _);
+        println!("{:?}", font.size);
+        let (regular, bold, italic) = Self::compute_font_keys(&font, &mut self.rasterizer)?;
+        self.rasterizer.get_glyph(&GlyphKey { font_key: regular, c: 'm', size: font.size() })?;
+        let metrics = self.rasterizer.metrics(regular)?;
+
+        self.font_size = font.size;
+        self.font_key = regular;
+        self.bold_key = bold;
+        self.italic_key = italic;
+        self.metrics = metrics;
+
+        self.load_glyphs_for_font(regular, loader);
+        self.load_glyphs_for_font(bold, loader);
+        self.load_glyphs_for_font(italic, loader);
+
+        Ok(())
     }
 }
 
@@ -306,6 +349,7 @@ struct InstanceData {
     bg_r: f32,
     bg_g: f32,
     bg_b: f32,
+    bg_a: f32,
 }
 
 #[derive(Debug)]
@@ -316,6 +360,7 @@ pub struct QuadRenderer {
     ebo: GLuint,
     vbo_instance: GLuint,
     atlas: Vec<Atlas>,
+    current_atlas: usize,
     active_tex: GLuint,
     batch: Batch,
     rx: mpsc::Receiver<Msg>,
@@ -326,6 +371,7 @@ pub struct RenderApi<'a> {
     active_tex: &'a mut GLuint,
     batch: &'a mut Batch,
     atlas: &'a mut Vec<Atlas>,
+    current_atlas: &'a mut usize,
     program: &'a mut ShaderProgram,
     config: &'a Config,
     visual_bell_intensity: f32
@@ -335,6 +381,7 @@ pub struct RenderApi<'a> {
 pub struct LoaderApi<'a> {
     active_tex: &'a mut GLuint,
     atlas: &'a mut Vec<Atlas>,
+    current_atlas: &'a mut usize,
 }
 
 #[derive(Debug)]
@@ -388,6 +435,7 @@ impl Batch {
             bg_r: cell.bg.r as f32,
             bg_g: cell.bg.g as f32,
             bg_b: cell.bg.b as f32,
+            bg_a: cell.bg_alpha,
         });
     }
 
@@ -520,7 +568,7 @@ impl QuadRenderer {
             gl::EnableVertexAttribArray(4);
             gl::VertexAttribDivisor(4, 1);
             // color
-            gl::VertexAttribPointer(5, 3,
+            gl::VertexAttribPointer(5, 4,
                                     gl::FLOAT, gl::FALSE,
                                     size_of::<InstanceData>() as i32,
                                     (13 * size_of::<f32>()) as *const _);
@@ -536,29 +584,22 @@ impl QuadRenderer {
         if cfg!(feature = "live-shader-reload") {
             ::std::thread::spawn(move || {
                 let (tx, rx) = ::std::sync::mpsc::channel();
-                let mut watcher = Watcher::new(tx).expect("create file watcher");
-                watcher.watch(TEXT_SHADER_F_PATH).expect("watch fragment shader");
-                watcher.watch(TEXT_SHADER_V_PATH).expect("watch vertex shader");
+                // The Duration argument is a debouncing period.
+                let mut watcher = watcher(tx, Duration::from_millis(10)).expect("create file watcher");
+                watcher.watch(TEXT_SHADER_F_PATH, RecursiveMode::NonRecursive)
+                       .expect("watch fragment shader");
+                watcher.watch(TEXT_SHADER_V_PATH, RecursiveMode::NonRecursive)
+                       .expect("watch vertex shader");
 
                 loop {
                     let event = rx.recv().expect("watcher event");
-                    let ::notify::Event { path, op } = event;
 
-                    if let Ok(op) = op {
-                        if op.contains(op::RENAME) {
-                            continue;
+                    match event {
+                        DebouncedEvent::Rename(_, _) => continue,
+                        DebouncedEvent::Create(_) | DebouncedEvent::Write(_) | DebouncedEvent::Chmod(_) => {
+                            msg_tx.send(Msg::ShaderReload).expect("msg send ok");
                         }
-
-                        if op.contains(op::IGNORED) {
-                            if let Some(path) = path.as_ref() {
-                                if let Err(err) = watcher.watch(path) {
-                                    warn!("failed to establish watch on {:?}: {:?}", path, err);
-                                }
-                            }
-
-                            msg_tx.send(Msg::ShaderReload)
-                                .expect("msg send ok");
-                        }
+                        _ => {}
                     }
                 }
             });
@@ -571,6 +612,7 @@ impl QuadRenderer {
             ebo: ebo,
             vbo_instance: vbo_instance,
             atlas: Vec::new(),
+            current_atlas: 0,
             active_tex: 0,
             batch: Batch::new(),
             rx: msg_rx,
@@ -594,7 +636,7 @@ impl QuadRenderer {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 Msg::ShaderReload => {
-                    self.reload_shaders(&config, Size {
+                    self.reload_shaders(config, Size {
                         width: Pixels(props.width as u32),
                         height: Pixels(props.height as u32)
                     });
@@ -606,7 +648,6 @@ impl QuadRenderer {
             self.program.activate();
             self.program.set_term_uniforms(props);
             self.program.set_visual_bell(visual_bell_intensity as _);
-            self.program.set_bg_opacity(config.background_opacity().get());
 
             gl::BindVertexArray(self.vao);
             gl::BindBuffer(gl::ELEMENT_ARRAY_BUFFER, self.ebo);
@@ -618,6 +659,7 @@ impl QuadRenderer {
             active_tex: &mut self.active_tex,
             batch: &mut self.batch,
             atlas: &mut self.atlas,
+            current_atlas: &mut self.current_atlas,
             program: &mut self.program,
             visual_bell_intensity: visual_bell_intensity as _,
             config: config,
@@ -644,21 +686,27 @@ impl QuadRenderer {
         func(LoaderApi {
             active_tex: &mut self.active_tex,
             atlas: &mut self.atlas,
+            current_atlas: &mut self.current_atlas,
         })
     }
 
     pub fn reload_shaders(&mut self, config: &Config, size: Size<Pixels<u32>>) {
-        info!("Reloading shaders");
+        warn!("Reloading shaders ...");
         let program = match ShaderProgram::new(config, size) {
-            Ok(program) => program,
+            Ok(program) => {
+                warn!(" ... OK");
+                program
+            },
             Err(err) => {
                 match err {
                     ShaderCreationError::Io(err) => {
                         error!("Error reading shader file: {}", err);
                     },
                     ShaderCreationError::Compile(path, log) => {
-                        error!("Error compiling shader at {:?}", path);
-                        let _ = io::copy(&mut log.as_bytes(), &mut io::stdout());
+                        error!("Error compiling shader at {:?}\n{}", path, log);
+                    }
+                    ShaderCreationError::Link(log) => {
+                        error!("Error reloading shaders: {}", log);
                     }
                 }
 
@@ -747,6 +795,7 @@ impl<'a> RenderApi<'a> {
                 bg: color,
                 fg: Rgb { r: 0, g: 0, b: 0 },
                 flags: cell::Flags::empty(),
+                bg_alpha: 1.0
             })
             .collect::<Vec<_>>();
 
@@ -821,15 +870,23 @@ impl<'a> LoadGlyph for LoaderApi<'a> {
     fn load_glyph(&mut self, rasterized: &RasterizedGlyph) -> Glyph {
         // At least one atlas is guaranteed to be in the `self.atlas` list; thus
         // the unwrap should always be ok.
-        match self.atlas.last_mut().unwrap().insert(rasterized, &mut self.active_tex) {
+        match self.atlas[*self.current_atlas].insert(rasterized, &mut self.active_tex) {
             Ok(glyph) => glyph,
             Err(_) => {
                 let atlas = Atlas::new(ATLAS_SIZE);
                 *self.active_tex = 0; // Atlas::new binds a texture. Ugh this is sloppy.
+                *self.current_atlas = 0;
                 self.atlas.push(atlas);
                 self.load_glyph(rasterized)
             }
         }
+    }
+
+    fn clear(&mut self) {
+        for atlas in self.atlas.iter_mut() {
+            atlas.clear();
+        }
+        *self.current_atlas = 0;
     }
 }
 
@@ -840,15 +897,25 @@ impl<'a> LoadGlyph for RenderApi<'a> {
     fn load_glyph(&mut self, rasterized: &RasterizedGlyph) -> Glyph {
         // At least one atlas is guaranteed to be in the `self.atlas` list; thus
         // the unwrap.
-        match self.atlas.last_mut().unwrap().insert(rasterized, &mut self.active_tex) {
+        match self.atlas[*self.current_atlas].insert(rasterized, &mut self.active_tex) {
             Ok(glyph) => glyph,
             Err(_) => {
-                let atlas = Atlas::new(ATLAS_SIZE);
-                *self.active_tex = 0; // Atlas::new binds a texture. Ugh this is sloppy.
-                self.atlas.push(atlas);
+                *self.current_atlas += 1;
+                if *self.current_atlas == self.atlas.len() {
+                    let atlas = Atlas::new(ATLAS_SIZE);
+                    *self.active_tex = 0; // Atlas::new binds a texture. Ugh this is sloppy.
+                    self.atlas.push(atlas);
+                }
                 self.load_glyph(rasterized)
             }
         }
+    }
+
+    fn clear(&mut self) {
+        for atlas in self.atlas.iter_mut() {
+            atlas.clear();
+        }
+        *self.current_atlas = 0;
     }
 }
 
@@ -897,7 +964,7 @@ impl ShaderProgram {
             gl::FRAGMENT_SHADER,
             frag_source
         )?;
-        let program = ShaderProgram::create_program(vertex_shader, fragment_shader);
+        let program = ShaderProgram::create_program(vertex_shader, fragment_shader)?;
 
         unsafe {
             gl::DeleteShader(vertex_shader);
@@ -920,14 +987,13 @@ impl ShaderProgram {
         }
 
         // get uniform locations
-        let (projection, term_dim, cell_dim, visual_bell, background, bg_opacity) = unsafe {
+        let (projection, term_dim, cell_dim, visual_bell, background) = unsafe {
             (
                 gl::GetUniformLocation(program, cptr!(b"projection\0")),
                 gl::GetUniformLocation(program, cptr!(b"termDim\0")),
                 gl::GetUniformLocation(program, cptr!(b"cellDim\0")),
                 gl::GetUniformLocation(program, cptr!(b"visualBell\0")),
                 gl::GetUniformLocation(program, cptr!(b"backgroundPass\0")),
-                gl::GetUniformLocation(program, cptr!(b"bgOpacity\0")),
             )
         };
 
@@ -942,7 +1008,6 @@ impl ShaderProgram {
             u_background: background,
             padding_x: config.padding().x.floor(),
             padding_y: config.padding().y.floor(),
-            u_bg_opacity: bg_opacity,
         };
 
         shader.update_projection(*size.width as f32, *size.height as f32);
@@ -1003,13 +1068,7 @@ impl ShaderProgram {
         }
     }
 
-    fn set_bg_opacity(&self, bg_opacity: f32) {
-        unsafe {
-            gl::Uniform1f(self.u_bg_opacity, bg_opacity);
-        }
-    }
-
-    fn create_program(vertex: GLuint, fragment: GLuint) -> GLuint {
+    fn create_program(vertex: GLuint, fragment: GLuint) -> Result<GLuint, ShaderCreationError> {
         unsafe {
             let program = gl::CreateProgram();
             gl::AttachShader(program, vertex);
@@ -1020,10 +1079,10 @@ impl ShaderProgram {
             gl::GetProgramiv(program, gl::LINK_STATUS, &mut success);
 
             if success != (gl::TRUE as GLint) {
-                error!("{}", get_program_info_log(program));
-                panic!("failed to link shader program");
+                Err(ShaderCreationError::Link(get_program_info_log(program)))
+            } else {
+                Ok(program)
             }
-            program
         }
     }
 
@@ -1138,13 +1197,16 @@ pub enum ShaderCreationError {
 
     /// Error compiling shader
     Compile(PathBuf, String),
+
+    /// Problem linking
+    Link(String),
 }
 
 impl ::std::error::Error for ShaderCreationError {
     fn cause(&self) -> Option<&::std::error::Error> {
         match *self {
             ShaderCreationError::Io(ref err) => Some(err),
-            ShaderCreationError::Compile(_, _) => None,
+            _ => None,
         }
     }
 
@@ -1152,6 +1214,7 @@ impl ::std::error::Error for ShaderCreationError {
         match *self {
             ShaderCreationError::Io(ref err) => err.description(),
             ShaderCreationError::Compile(ref _path, ref s) => s.as_str(),
+            ShaderCreationError::Link(ref s) => s.as_str(),
         }
     }
 }
@@ -1162,6 +1225,9 @@ impl ::std::fmt::Display for ShaderCreationError {
             ShaderCreationError::Io(ref err) => write!(f, "couldn't read shader: {}", err),
             ShaderCreationError::Compile(ref _path, ref s) => {
                 write!(f, "failed compiling shader: {}", s)
+            },
+            ShaderCreationError::Link(ref s) => {
+                write!(f, "failed linking shader: {}", s)
             },
         }
     }
@@ -1259,6 +1325,12 @@ impl Atlas {
             row_baseline: 0,
             row_tallest: 0,
         }
+    }
+
+    pub fn clear(&mut self) {
+        self.row_extent = 0;
+        self.row_baseline = 0;
+        self.row_tallest = 0;
     }
 
     /// Insert a RasterizedGlyph into the texture atlas

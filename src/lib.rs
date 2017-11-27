@@ -15,7 +15,6 @@
 //! Alacritty - The GPU Enhanced Terminal
 #![cfg_attr(feature = "clippy", feature(plugin))]
 #![cfg_attr(feature = "clippy", plugin(clippy))]
-#![cfg_attr(feature = "clippy", deny(clippy))]
 #![cfg_attr(feature = "clippy", deny(enum_glob_use))]
 #![cfg_attr(feature = "clippy", deny(if_not_else))]
 #![cfg_attr(feature = "clippy", deny(wrong_pub_self_convention))]
@@ -34,11 +33,13 @@ extern crate arraydeque;
 extern crate cgmath;
 extern crate copypasta;
 extern crate errno;
+extern crate env_logger;
 extern crate fnv;
 extern crate font;
 extern crate glutin;
 extern crate libc;
 extern crate mio;
+extern crate mio_more;
 extern crate notify;
 extern crate parking_lot;
 extern crate serde;
@@ -102,7 +103,13 @@ impl Mul<f32> for Rgb {
 
 #[cfg_attr(feature = "clippy", allow(too_many_arguments))]
 #[cfg_attr(feature = "clippy", allow(doc_markdown))]
+#[cfg_attr(feature = "clippy", allow(unreadable_literal))]
 pub mod gl {
     #![allow(non_upper_case_globals)]
     include!(concat!(env!("OUT_DIR"), "/gl_bindings.rs"));
+}
+
+#[allow(dead_code)]
+mod built_info {
+    include!(concat!(env!("OUT_DIR"), "/built.rs"));
 }

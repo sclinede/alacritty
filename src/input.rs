@@ -62,6 +62,8 @@ pub trait ActionContext {
     fn received_count(&mut self) -> &mut usize;
     fn suppress_chars(&mut self) -> &mut bool;
     fn last_modifiers(&mut self) -> &mut ModifiersState;
+    fn change_font_size(&mut self, delta: i8);
+    fn reset_font_size(&mut self);
 }
 
 /// Describes a state and action to take in that state
@@ -154,6 +156,15 @@ pub enum Action {
     /// Paste contents of selection buffer
     PasteSelection,
 
+    /// Increase font size
+    IncreaseFontSize,
+
+    /// Decrease font size
+    DecreaseFontSize,
+
+    /// Reset font size to the config value
+    ResetFontSize,
+
     /// Run given command
     Command(String, Vec<String>),
 
@@ -176,7 +187,7 @@ impl Action {
                     .and_then(|clipboard| clipboard.load_primary() )
                     .map(|contents| { self.paste(ctx, contents) })
                     .unwrap_or_else(|err| {
-                        err_println!("Error loading data from clipboard. {}", Red(err));
+                        eprintln!("Error loading data from clipboard. {}", Red(err));
                     });
             },
             Action::PasteSelection => {
@@ -202,6 +213,15 @@ impl Action {
                 // FIXME should do a more graceful shutdown
                 ::std::process::exit(0);
             },
+            Action::IncreaseFontSize => {
+               ctx.change_font_size(1);
+            },
+            Action::DecreaseFontSize => {
+               ctx.change_font_size(-1);
+            }
+            Action::ResetFontSize => {
+               ctx.reset_font_size();
+            }
         }
     }
 
@@ -267,9 +287,9 @@ impl<'a, A: ActionContext + 'a> Processor<'a, A> {
 
         if line < Line(223) && column < Column(223) {
             let msg = vec![
-                '\x1b' as u8,
-                '[' as u8,
-                'M' as u8,
+                b'\x1b',
+                b'[',
+                b'M',
                 32 + button,
                 32 + 1 + column.0 as u8,
                 32 + 1 + line.0 as u8,
@@ -352,15 +372,18 @@ impl<'a, A: ActionContext + 'a> Processor<'a, A> {
 
         match delta {
             MouseScrollDelta::LineDelta(_columns, lines) => {
-                let code = if lines > 0.0 {
+                let to_scroll = self.ctx.mouse_mut().lines_scrolled + lines;
+
+                let code = if to_scroll > 0.0 {
                     64
                 } else {
                     65
                 };
 
-                for _ in 0..(lines.abs() as usize) {
+                for _ in 0..(to_scroll.abs() as usize) {
                     self.normal_mouse_report(code);
                 }
+                self.ctx.mouse_mut().lines_scrolled = to_scroll % 1.0;
             },
             MouseScrollDelta::PixelDelta(_x, y) => {
                 match phase {
@@ -440,7 +463,7 @@ impl<'a, A: ActionContext + 'a> Processor<'a, A> {
                 *self.ctx.received_count() = 0;
                 *self.ctx.suppress_chars() = false;
 
-                if self.process_key_bindings(&mods, key) {
+                if self.process_key_bindings(mods, key) {
                     *self.ctx.suppress_chars() = true;
                 }
             },
@@ -589,6 +612,10 @@ mod tests {
         }
         fn last_modifiers(&mut self) -> &mut ModifiersState {
             &mut self.last_modifiers
+        }
+        fn change_font_size(&mut self, _delta: i8) {
+        }
+        fn reset_font_size(&mut self) {
         }
     }
 

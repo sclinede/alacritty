@@ -37,7 +37,7 @@ static mut PID: pid_t = 0;
 ///
 /// Calling exit() in the SIGCHLD handler sometimes causes opengl to deadlock,
 /// and the process hangs. Instead, this flag is set, and its status can be
-/// cheked via `process_should_exit`.
+/// checked via `process_should_exit`.
 static mut SHOULD_EXIT: bool = false;
 
 extern "C" fn sigchld(_a: c_int) {
@@ -183,9 +183,9 @@ pub fn new<T: ToWinsize>(config: &Config, options: &Options, size: T, window_id:
 
     let default_shell = &Shell::new(pw.shell);
     let shell = config.shell()
-        .unwrap_or(&default_shell);
+        .unwrap_or(default_shell);
 
-    let initial_command = options.command().unwrap_or(&shell);
+    let initial_command = options.command().unwrap_or(shell);
 
     let mut builder = Command::new(initial_command.program());
     for arg in initial_command.args() {

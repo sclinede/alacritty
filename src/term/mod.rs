@@ -291,6 +291,14 @@ impl<'a> RenderableCellsIter<'a> {
         }
     }
 
+    #[inline]
+    fn compute_bg_alpha(&self, bg: &Color) -> f32 {
+        match *bg {
+            Color::Named(NamedColor::Background) => 0.0,
+            _ => 1.0
+        }
+    }
+
     fn compute_bg_rgb(&self, bg: &Color) -> Rgb {
         match *bg {
             Color::Spec(rgb) => rgb,
@@ -306,6 +314,7 @@ pub struct RenderableCell {
     pub c: char,
     pub fg: Rgb,
     pub bg: Rgb,
+    pub bg_alpha: f32,
     pub flags: cell::Flags,
 }
 
@@ -356,19 +365,35 @@ impl<'a> Iterator for RenderableCellsIter<'a> {
                 };
 
                 // Apply inversion and lookup RGB values
-                let (fg, bg) = if selected || cell.inverse() {
-                    (self.compute_bg_rgb(&cell.bg), self.compute_fg_rgb(&cell.fg, &cell))
+                let mut bg_alpha = 1.0;
+                let fg_rgb;
+                let bg_rgb;
+
+                let invert = selected ^ cell.inverse();
+
+                if invert {
+                    if cell.fg == cell.bg {
+                        bg_rgb = self.colors[NamedColor::Foreground];
+                        fg_rgb = self.colors[NamedColor::Background];
+                        bg_alpha = 1.0
+                    } else {
+                        bg_rgb = self.compute_fg_rgb(&cell.fg, &cell);
+                        fg_rgb = self.compute_bg_rgb(&cell.bg);
+                    }
                 } else {
-                    (self.compute_fg_rgb(&cell.fg, &cell), self.compute_bg_rgb(&cell.bg))
-                };
+                    fg_rgb = self.compute_fg_rgb(&cell.fg, &cell);
+                    bg_rgb = self.compute_bg_rgb(&cell.bg);
+                    bg_alpha = self.compute_bg_alpha(&cell.bg);
+                }
 
                 return Some(RenderableCell {
                     line: line,
                     column: column,
                     flags: cell.flags,
                     c: cell.c,
-                    fg: fg,
-                    bg: bg,
+                    fg: fg_rgb,
+                    bg: bg_rgb,
+                    bg_alpha: bg_alpha,
                 })
             }
 
@@ -383,21 +408,21 @@ impl<'a> Iterator for RenderableCellsIter<'a> {
 
 pub mod mode {
     bitflags! {
-        pub flags TermMode: u16 {
-            const SHOW_CURSOR         = 0b000000000001,
-            const APP_CURSOR          = 0b000000000010,
-            const APP_KEYPAD          = 0b000000000100,
-            const MOUSE_REPORT_CLICK  = 0b000000001000,
-            const BRACKETED_PASTE     = 0b000000010000,
-            const SGR_MOUSE           = 0b000000100000,
-            const MOUSE_MOTION        = 0b000001000000,
-            const LINE_WRAP           = 0b000010000000,
-            const LINE_FEED_NEW_LINE  = 0b000100000000,
-            const ORIGIN              = 0b001000000000,
-            const INSERT              = 0b010000000000,
-            const FOCUS_IN_OUT        = 0b100000000000,
-            const ANY                 = 0b111111111111,
-            const NONE                = 0,
+        pub struct TermMode: u16 {
+            const SHOW_CURSOR         = 0b000000000001;
+            const APP_CURSOR          = 0b000000000010;
+            const APP_KEYPAD          = 0b000000000100;
+            const MOUSE_REPORT_CLICK  = 0b000000001000;
+            const BRACKETED_PASTE     = 0b000000010000;
+            const SGR_MOUSE           = 0b000000100000;
+            const MOUSE_MOTION        = 0b000001000000;
+            const LINE_WRAP           = 0b000010000000;
+            const LINE_FEED_NEW_LINE  = 0b000100000000;
+            const ORIGIN              = 0b001000000000;
+            const INSERT              = 0b010000000000;
+            const FOCUS_IN_OUT        = 0b100000000000;
+            const ANY                 = 0b111111111111;
+            const NONE                = 0;
         }
     }
 
@@ -527,7 +552,7 @@ impl VisualBell {
         self.intensity_at_instant(now)
     }
 
-    /// Get the currenty intensity of the visual bell. The bell's intensity
+    /// Get the currently intensity of the visual bell. The bell's intensity
     /// ramps down from 1.0 to 0.0 at a rate determined by the bell's duration.
     pub fn intensity(&self) -> f64 {
         self.intensity_at_instant(Instant::now())
@@ -618,7 +643,7 @@ pub struct Term {
     /// This is true after the last column is set with the input function. Any function that
     /// implicitly sets the line or column needs to set this to false to avoid wrapping twice.
     /// input_needs_wrap ensures that cursor.col is always valid for use into indexing into
-    /// arrays. Without it we wold have to sanitize cursor.col every time we used it.
+    /// arrays. Without it we would have to sanitize cursor.col every time we used it.
     input_needs_wrap: bool,
 
     /// Got a request to set title; it's buffered here until next draw.
@@ -648,12 +673,16 @@ pub struct Term {
     /// Scroll region
     scroll_region: Range<Line>,
 
+    /// Font size modifier
+    pub font_size_modifier: i8,
+
     /// Size
     size_info: SizeInfo,
 
     pub dirty: bool,
 
     pub visual_bell: VisualBell,
+    pub next_is_urgent: Option<bool>,
 
     /// Saved cursor from main grid
     cursor_save: Cursor,
@@ -664,7 +693,10 @@ pub struct Term {
     semantic_escape_chars: String,
 
     /// Colors used for rendering
-    pub colors: color::List,
+    colors: color::List,
+
+    /// Is color in `colors` modified or not
+    color_modified: [bool; color::COUNT],
 
     /// Original colors from config
     original_colors: color::List,
@@ -753,10 +785,12 @@ impl Term {
             next_title: None,
             dirty: false,
             visual_bell: VisualBell::new(config),
+            next_is_urgent: None,
             input_needs_wrap: false,
             grid: grid,
             alt_grid: alt,
             alt: false,
+            font_size_modifier: 0,
             active_charset: Default::default(),
             cursor: Default::default(),
             cursor_save: Default::default(),
@@ -766,15 +800,33 @@ impl Term {
             scroll_region: scroll_region,
             size_info: size,
             colors: color::List::from(config.colors()),
+            color_modified: [false; color::COUNT],
             original_colors: color::List::from(config.colors()),
             semantic_escape_chars: config.selection().semantic_escape_chars.clone(),
             cursor_style: CursorStyle::Block,
         }
     }
 
+    pub fn change_font_size(&mut self, delta: i8) {
+        if let Some(sum) = self.font_size_modifier.checked_add(delta) {
+            self.font_size_modifier = sum;
+            self.dirty = true;
+        }
+    }
+
+    pub fn reset_font_size(&mut self) {
+        self.font_size_modifier = 0;
+        self.dirty = true;
+    }
+
     pub fn update_config(&mut self, config: &Config) {
         self.semantic_escape_chars = config.selection().semantic_escape_chars.clone();
         self.original_colors.fill_named(config.colors());
+        for i in 0..color::COUNT {
+            if !self.color_modified[i] {
+                self.colors[i] = self.original_colors[i];
+            }
+        }
         self.visual_bell.update_config(config);
     }
 
@@ -944,35 +996,27 @@ impl Term {
             self.mode,
             config,
             selection,
-            self.cursor_style
+            self.cursor_style,
         )
     }
 
     /// Resize terminal to new dimensions
-    pub fn resize(&mut self, width: f32, height: f32) {
+    pub fn resize(&mut self, size : &SizeInfo) {
         debug!("Term::resize");
+
         // Bounds check; lots of math assumes width and height are > 0
-        if width as usize <= 2 * self.size_info.padding_x as usize ||
-            height as usize <= 2 * self.size_info.padding_y as usize
+        if size.width as usize <= 2 * self.size_info.padding_x as usize ||
+            size.height as usize <= 2 * self.size_info.padding_y as usize
         {
             return;
         }
-
-        let size = SizeInfo {
-            width: width,
-            height: height,
-            cell_width: self.size_info.cell_width,
-            cell_height: self.size_info.cell_height,
-            padding_x: self.size_info.padding_x,
-            padding_y: self.size_info.padding_y,
-        };
 
         let old_cols = self.grid.num_cols();
         let old_lines = self.grid.num_lines();
         let mut num_cols = size.cols();
         let mut num_lines = size.lines();
 
-        self.size_info = size;
+        self.size_info = *size;
 
         if old_cols == num_cols && old_lines == num_lines {
             debug!("Term::resize dimensions unchanged");
@@ -1008,7 +1052,7 @@ impl Term {
         debug!("num_cols, num_lines = {}, {}", num_cols, num_lines);
 
         // Resize grids to new size
-        let template = self.cursor.template;
+        let template = Cell::default();
         self.grid.resize(num_lines, num_cols, &template);
         self.alt_grid.resize(num_lines, num_cols, &template);
 
@@ -1398,9 +1442,10 @@ impl ansi::Handler for Term {
     #[inline]
     fn linefeed(&mut self) {
         trace!("linefeed");
-        if (self.cursor.point.line + 1) == self.scroll_region.end {
+        let next = self.cursor.point.line + 1;
+        if next == self.scroll_region.end {
             self.scroll_up(Line(1));
-        } else {
+        } else if next < self.grid.num_lines() {
             self.cursor.point.line += 1;
         }
     }
@@ -1410,6 +1455,7 @@ impl ansi::Handler for Term {
     fn bell(&mut self) {
         trace!("bell");
         self.visual_bell.ring();
+        self.next_is_urgent = Some(true);
     }
 
     #[inline]
@@ -1422,13 +1468,13 @@ impl ansi::Handler for Term {
     /// LF/NL mode has some interesting history. According to ECMA-48 4th
     /// edition, in LINE FEED mode,
     ///
-    /// > The execution of the formator functions LINE FEED (LF), FORM FEED
+    /// > The execution of the formatter functions LINE FEED (LF), FORM FEED
     /// (FF), LINE TABULATION (VT) cause only movement of the active position in
     /// the direction of the line progression.
     ///
     /// In NEW LINE mode,
     ///
-    /// > The execution of the formator functions LINE FEED (LF), FORM FEED
+    /// > The execution of the formatter functions LINE FEED (LF), FORM FEED
     /// (FF), LINE TABULATION (VT) cause movement to the line home position on
     /// the following line, the following form, etc. In the case of LF this is
     /// referred to as the New Line (NL) option.
@@ -1550,7 +1596,7 @@ impl ansi::Handler for Term {
     #[inline]
     fn save_cursor_position(&mut self) {
         trace!("CursorSave");
-        let mut cursor = if self.alt {
+        let cursor = if self.alt {
             &mut self.cursor_save_alt
         } else {
             &mut self.cursor_save
@@ -1608,6 +1654,7 @@ impl ansi::Handler for Term {
     fn set_color(&mut self, index: usize, color: Rgb) {
         trace!("set_color[{}] = {:?}", index, color);
         self.colors[index] = color;
+        self.color_modified[index] = true;
     }
 
     /// Reset the indexed color to original value
@@ -1615,6 +1662,7 @@ impl ansi::Handler for Term {
     fn reset_color(&mut self, index: usize) {
         trace!("reset_color[{}]", index);
         self.colors[index] = self.original_colors[index];
+        self.color_modified[index] = false;
     }
 
     #[inline]
